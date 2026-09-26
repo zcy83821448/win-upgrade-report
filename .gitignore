@@ -1,0 +1,18 @@
+# 运行时数据（首次运行会自动生成，含本机绝对路径，不入库）
+config.json
+state.json
+
+# 抓取/生成的内容
+logs/
+reports/
+
+# 构建产物
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# 编辑器
+.vscode/
+.idea/
