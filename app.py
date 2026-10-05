@@ -92,6 +92,20 @@ def _selftest():
     except Exception as e:
         out("  游戏判定    : 失败 ->", e)
     try:
+        import time as _t
+        import tray as _tray
+        _ic = config.resource_path("icon.ico")
+        _tr = _tray.Tray(_ic, tip="win升级报告 自检")
+        _ok = _tr.start()
+        _t.sleep(0.8)
+        _rect = _tr.icon_rect()
+        _tr.stop()
+        out("  托盘图标    :",
+            f"可以创建（位置 {_rect}）" if _ok else
+            f"创建失败 -> {_tr._error or '未知原因'}")
+    except Exception as e:
+        out("  托盘图标    : 失败 ->", e)
+    try:
         import tkinter  # noqa: F401
         out("  tkinter     : OK")
     except Exception as e:

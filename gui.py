@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (load_config, save_config, load_state, channel_state,   # noqa: E402
                     resolve_api_key, mask_key, BASE_DIR, REPORT_DIR, LOG_DIR,
                     resource_path, is_frozen, app_exe,
-                    load_watch, request_check_now)
+                    load_watch, request_check_now, request_exit, patch_config)
 import channels as ch_mod                                                   # noqa: E402
 import notify                                                               # noqa: E402
 import reporter                                                             # noqa: E402
@@ -52,6 +52,13 @@ def view_cmd(arg):
     if FROZEN:
         return [sys.executable, "--view", arg]
     return [pythonw(), os.path.join(BASE_DIR, "viewer.py"), arg]
+
+
+def watch_cmd(args=None):
+    """哨兵模式的命令行：打包后是自己这个 exe 加 --watch，源码时是 pythonw watch.py。"""
+    if FROZEN:
+        return [sys.executable, "--watch"] + list(args or [])
+    return [pythonw(), WATCH] + list(args or [])
 
 
 def run_background(args):
@@ -300,8 +307,15 @@ class App:
         self.btn_check.pack(side="left", padx=6)
         self.btn_toast = ttk.Button(btns, text="发测试通知", command=self.test_toast)
         self.btn_toast.pack(side="left")
-        self.btn_close = ttk.Button(btns, text="关闭", command=root.destroy)
-        self.btn_close.pack(side="right")
+        # 两种关闭方式：默认只关窗口（后台继续跑），另一个把后台监控彻底停掉
+        self.btn_quit_all = ttk.Button(btns, text="完全关闭后台监控",
+                                       command=self.quit_all)
+        self.btn_quit_all.pack(side="right")
+        self.btn_close = ttk.Button(btns, text="关闭到托盘",
+                                    command=self.close_to_tray)
+        self.btn_close.pack(side="right", padx=6)
+        # 点窗口右上角的 × 也走「关闭到托盘」，并问一次要不要彻底关
+        root.protocol("WM_DELETE_WINDOW", self.close_to_tray)
 
         self.reload_channels()
         self.refresh_status()
@@ -721,13 +735,15 @@ class App:
 
     def _build_detect(self, p):
         # ---------- 哨兵：每隔几分钟问一次官方看板 ----------
-        self._check(p, 0, "开启即时提醒（哨兵常驻：登录后一直开着）", "watch_enabled")
+        self._check(p, 0, "开启后台监控（哨兵常驻：登录后一直开着，托盘有图标）",
+                    "watch_enabled")
         self._entry(p, 1, "每隔几分钟看一次", "watch_interval_minutes", 6,
                     "只问「官网变了没有」；没变化时传输 0 字节，也不调 AI")
         ttk.Label(p, text="官方看板一变，就抓发布说明 → 让 AI 写成中文报告 → 弹一条通知。\n"
                           "从「官网发布」到「你收到通知」通常 2～5 分钟"
                           "（其中 AI 总结约占 30～90 秒）。\n"
-                          "没新版本时不发任何通知，日志也不刷。",
+                          "没新版本时不发任何通知，日志也不刷。\n"
+                          "右下角托盘图标可以随时看状态、立刻检测、或者完全关掉它。",
                   foreground="#888", justify="left").grid(row=2, column=1, columnspan=2,
                                                           sticky="w", pady=(0, 8))
 
@@ -865,6 +881,8 @@ class App:
         ttk.Button(p, text="立刻静默跑一次（手动检测）",
                    command=lambda: self.run_silent(["--force"])
                    ).grid(row=5, column=1, columnspan=2, sticky="w")
+        ttk.Button(p, text="启动后台监控", command=self.start_watch
+                   ).grid(row=5, column=3, sticky="w")
         self.btn_startup = ttk.Button(p, text="装/卸 登录自启（免管理员备用）",
                                       command=self.toggle_startup)
         self.btn_startup.grid(row=6, column=0, columnspan=2, sticky="w")
@@ -902,6 +920,12 @@ class App:
                        f"　上次有新版本：{w.get('last_change') or '还没有过'}"
                        f"　间隔：每 {w.get('interval_minutes')} 分钟"
                        f"　累计检测 {w.get('checks')} 次")
+                txt += ("\n托盘图标：已挂上（任务栏右下角；"
+                        "看不到就点那个 ∧ 展开，或者右键「显示隐藏的图标」）"
+                        if w.get("tray") else
+                        "\n托盘图标：没挂上（不影响检测，看 logs\\checker.log 里的原因）")
+                txt += ("\n　「设置 → 个性化 → 任务栏 → 其他系统托盘图标」里"
+                        "把 win升级报告 打开，它就会一直显示")
                 if w.get("game_exe"):
                     txt += f"\n因为检测到全屏程序而静默：{w.get('game_exe')}"
                 if w.get("manual_until"):
@@ -910,8 +934,10 @@ class App:
                     txt += f"\n最近结果：{w.get('last_result')}"
             else:
                 txt = ("哨兵：没有在运行。\n"
-                       "刚开机的话等几秒再点「刷新哨兵状态」；一直是这样就重新装一次计划任务，"
-                       "或改用下面的「登录自启」。")
+                       "· 点上面「启动后台监控」立刻起来，不用等下次开机\n"
+                       "· 想让它以后每次登录自动起，就点「安装 / 更新计划任务」\n"
+                       "· 起来之后任务栏右下角会出现托盘图标"
+                       "（可能在「隐藏的图标」∧ 里面）")
             self.logon_lbl.configure(text=txt)
         except Exception:
             pass
@@ -1062,6 +1088,10 @@ class App:
         if cfg is None:
             return False
         save_config(cfg)
+        # 「开启后台监控」这个开关被关掉时，顺手让正在跑的那个哨兵也退干净
+        # （否则它会一直待在托盘里，用户会以为关不掉）
+        if not cfg.get("watch_enabled", True) and load_watch().get("online"):
+            request_exit()
         self.reload_channels()
         if not quiet:
             n = sum(1 for c in self.rows if c["enabled"])
@@ -1077,6 +1107,65 @@ class App:
 
     def set_status(self, text, color="#0a6cff"):
         self.status.configure(text=text, foreground=color)
+
+    # ================================================== 两种关闭方式
+    def close_to_tray(self):
+        """「关闭到托盘」：只关这个窗口，后台哨兵继续跑，托盘图标还在。
+
+        点窗口右上角的 × 也走这里 —— 先问一次，免得用户以为
+        「关掉窗口 = 关掉程序」。没有后台哨兵在跑时就直接关。
+        """
+        if load_watch().get("online"):
+            ans = messagebox.askyesnocancel(
+                APP_TITLE,
+                "要怎么关？\n\n"
+                "「是」= 关闭到托盘：窗口关掉，后台哨兵继续运行，\n"
+                "　　　　任务栏托盘里还有图标，随时能再打开设置。\n"
+                "「否」= 完全关闭：连后台监控一起停掉，托盘图标消失。\n"
+                "「取消」= 什么都不做。")
+            if ans is None:
+                return
+            if ans is False:
+                self.quit_all()
+                return
+        self.root.destroy()
+
+    def quit_all(self):
+        """「完全关闭」：停掉后台哨兵（托盘图标会消失），然后关窗口。"""
+        if not load_watch().get("online"):
+            self.set_status("后台哨兵本来就没在运行，直接关掉窗口。")
+            self.root.after(300, self.root.destroy)
+            return
+        if not messagebox.askokcancel(
+                APP_TITLE,
+                "完全关闭后台监控？\n\n"
+                "· 哨兵会停止运行，任务栏的托盘图标消失\n"
+                "· 以后开机也不会自动启动\n"
+                "· 计划任务本身保留着，随时在「计划任务」页点\n"
+                "　「启动后台监控」就能恢复"):
+            return
+        # 先把开关关掉再发退出请求：这样即使计划任务把它重启，它一启动就自己退出
+        patch_config(watch_enabled=False)
+        request_exit()
+        self.set_status("已请求哨兵退出，几秒内托盘图标会消失…")
+        self.root.after(900, self.root.destroy)
+
+    def start_watch(self):
+        """重新打开后台监控（对应「完全关闭」）。"""
+        patch_config(watch_enabled=True)
+        if load_watch().get("online"):
+            self.set_status("后台哨兵已经在运行了，托盘图标应该就在右下角。")
+            self.refresh_status()
+            return
+        try:
+            subprocess.Popen(watch_cmd(), cwd=BASE_DIR, creationflags=NO_WINDOW)
+        except Exception as e:
+            self.set_status(f"启动失败：{e}", "#c00")
+            return
+        self.set_status("已启动后台哨兵，几秒后右下角会出现托盘图标"
+                        "（如果没看到，可能先藏在任务栏的「隐藏的图标」里）。")
+        self.root.after(2500, self.refresh_status)
+        self.root.after(2500, self.refresh_logon_hint)
 
     def run_silent(self, args=None):
         """手动跑一次检测。
@@ -1212,10 +1301,11 @@ class App:
                 w.get("mode"), "正常")
             watch_txt = (f"哨兵：运行中　状态：{mode}　"
                          f"上次问官方：{w.get('last_check') or '还没问过'}　"
-                         f"每 {w.get('interval_minutes')} 分钟一次")
+                         f"每 {w.get('interval_minutes')} 分钟一次　"
+                         + ("托盘图标：已挂上" if w.get("tray") else "托盘图标：没挂上"))
         else:
-            watch_txt = ("哨兵：没有在运行　→ 到「计划任务」页装一次，"
-                         "或者看那边写的排查办法")
+            watch_txt = ("哨兵：没有在运行　→ 到「计划任务」页点「启动后台监控」"
+                         "立刻起来（起来了右下角会有托盘图标）")
 
         sumtxt = (watch_txt + "\n"
                   + "上次运行：" + (st.get("last_run_date") or "从未")

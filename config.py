@@ -74,6 +74,8 @@ WATCH_PATH = os.path.join(LOG_DIR, "watch.json")
 # 设置界面点「立刻检测」时留一个请求文件，让哨兵自己去查。
 # 这样 state.json 永远只有一个写入者，不会两个进程抢着写、把对方的记录覆盖掉。
 CHECK_NOW_PATH = os.path.join(LOG_DIR, "check_now.req")
+# 设置界面/托盘菜单点「完全关闭」时留一个退出请求，哨兵看到就干净退出
+EXIT_REQ_PATH = os.path.join(LOG_DIR, "exit.req")
 
 SCHEMA = 3
 
@@ -109,6 +111,9 @@ DEFAULTS = {
     # 设置界面里的「现在静默 2 小时」：存一个截止时间（ISO 字符串），
     # 哨兵读到它就会闭嘴到那个时间为止；空字符串表示不静默。
     "silent_until": "",
+    # 托盘图标第一次挂上时，弹一次气泡告诉用户「我在后台跑」以及看不到图标怎么办。
+    # 只提示一次，之后不再打扰。
+    "tray_hint_shown": False,
     "quiet_hours": "",                # 例如 23:00-07:00：这期间发现更新先攒着，出了时段再通知
     "notify_on_error_after": 3,       # 连续失败几次后发一次错误通知，0 = 不通知
     # ---- 以下是 v2「每天定时」的遗留项，只给手动 --check 用，哨兵流程不再依赖 ----
@@ -315,6 +320,40 @@ def take_check_now():
     except Exception:
         pass
     return False
+
+
+def request_exit():
+    """请哨兵「完全关闭」：设置界面和托盘菜单都走这里。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(EXIT_REQ_PATH, "w", encoding="utf-8") as f:
+            f.write(dt.datetime.now().isoformat(timespec="seconds"))
+        return True
+    except Exception:
+        return False
+
+
+def take_exit_request():
+    """哨兵取走退出请求。"""
+    try:
+        if os.path.exists(EXIT_REQ_PATH):
+            os.remove(EXIT_REQ_PATH)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def patch_config(**kv):
+    """只改几个键（读-改-写）。
+
+    设置界面和哨兵都可能用它切开关（比如「完全关闭」把 watch_enabled 设成 False）。
+    哨兵每一轮都会重读配置，所以改完不用重启它。
+    """
+    cfg = load_config()
+    cfg.update(kv)
+    save_config(cfg)
+    return cfg
 
 
 # --------------------------------------------------------------- 杂项
