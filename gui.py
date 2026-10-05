@@ -1208,45 +1208,26 @@ class App:
 
     # ================================================== 两种关闭方式
     def close_to_tray(self):
-        """「关闭到托盘」：只关这个窗口，后台哨兵继续跑，托盘图标还在。
+        """「关闭到托盘」：只关这个窗口，后台哨兵继续跑（托盘图标还在）。
 
-        点窗口右上角的 × 也走这里 —— 先问一次，免得用户以为
-        「关掉窗口 = 关掉程序」。没有后台哨兵在跑时就直接关。
+        点窗口右上角的 × 也是同一个行为。
+        **不弹确认框** —— 界面上已经有两个按钮各自写清楚了，点哪个就干哪个：
+            「关闭到托盘」      = 只关窗口
+            「完全关闭后台监控」 = 连后台一起停
         """
-        if load_watch().get("online"):
-            ans = messagebox.askyesnocancel(
-                APP_TITLE,
-                "要怎么关？\n\n"
-                "「是」= 关闭到托盘：窗口关掉，后台哨兵继续运行，\n"
-                "　　　　任务栏托盘里还有图标，随时能再打开设置。\n"
-                "「否」= 完全关闭：连后台监控一起停掉，托盘图标消失。\n"
-                "「取消」= 什么都不做。")
-            if ans is None:
-                return
-            if ans is False:
-                self.quit_all()
-                return
         self.root.destroy()
 
     def quit_all(self):
-        """「完全关闭」：停掉后台哨兵（托盘图标会消失），然后关窗口。"""
-        if not load_watch().get("online"):
-            self.set_status("后台哨兵本来就没在运行，直接关掉窗口。")
-            self.root.after(300, self.root.destroy)
-            return
-        if not messagebox.askokcancel(
-                APP_TITLE,
-                "完全关闭后台监控？\n\n"
-                "· 哨兵会停止运行，任务栏的托盘图标消失\n"
-                "· 以后开机也不会自动启动\n"
-                "· 计划任务本身保留着，随时在「计划任务」页点\n"
-                "　「启动后台监控」就能恢复"):
-            return
-        # 先把开关关掉再发退出请求：这样即使计划任务把它重启，它一启动就自己退出
-        patch_config(watch_enabled=False)
-        request_exit()
-        self.set_status("已请求哨兵退出，几秒内托盘图标会消失…")
-        self.root.after(900, self.root.destroy)
+        """「完全关闭」：先关掉总开关，再请哨兵退出，然后关窗口。
+
+        同样不弹确认框。哨兵最多 5 秒内退出，托盘图标随之消失。
+        """
+        if load_watch().get("online"):
+            # 先关开关再发退出请求：这样即使计划任务把它重启，
+            # 它一启动看到开关是关的就自己退了，不会「关了又自己回来」
+            patch_config(watch_enabled=False)
+            request_exit()
+        self.root.destroy()
 
     def start_watch(self):
         """重新打开后台监控（对应「完全关闭」）。"""
