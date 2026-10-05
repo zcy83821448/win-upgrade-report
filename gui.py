@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (load_config, save_config, load_state, channel_state,   # noqa: E402
                     resolve_api_key, mask_key, BASE_DIR, REPORT_DIR, LOG_DIR,
-                    resource_path, is_frozen, app_exe,
+                    resource_path, is_frozen, app_exe, child_env,
                     load_watch, request_check_now, request_exit, patch_config)
 import channels as ch_mod                                                   # noqa: E402
 import notify                                                               # noqa: E402
@@ -67,13 +67,19 @@ def watch_cmd(args=None):
 
 
 def run_background(args):
-    """后台静默跑一次检测，不看输出。"""
-    return subprocess.Popen(check_cmd(args), cwd=BASE_DIR, creationflags=NO_WINDOW)
+    """后台静默跑一次检测，不看输出。
+
+    注意 env：必须先把 _MEIPASS2 摘掉（见 config.child_env 的说明），
+    否则这个子进程会住进界面自己的临时目录，界面一退出就删不掉那个目录。
+    """
+    return subprocess.Popen(check_cmd(args), cwd=BASE_DIR,
+                            creationflags=NO_WINDOW, env=child_env())
 
 
 def spawn_view(arg):
     """打开查看器 / 总览页，不等待。"""
-    return subprocess.Popen(view_cmd(arg), cwd=BASE_DIR, creationflags=NO_WINDOW)
+    return subprocess.Popen(view_cmd(arg), cwd=BASE_DIR,
+                            creationflags=NO_WINDOW, env=child_env())
 
 
 def ps_run(args, timeout=90):
@@ -745,7 +751,7 @@ class App:
         """跑一次检测，把过程实时显示在「状态与日志」页里，不弹控制台。"""
         args = ["--force", "--verbose"] + list(extra or [])
         cmd = check_cmd(args, console=False)
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        env = child_env({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
         self._live_lines = []
         if load_watch().get("online"):
             note += "；注意哨兵正在运行"
@@ -1353,7 +1359,11 @@ class App:
             self.refresh_status()
             return
         try:
-            subprocess.Popen(watch_cmd(), cwd=BASE_DIR, creationflags=NO_WINDOW)
+            # env：必须摘掉 _MEIPASS2，否则哨兵会住进界面的临时目录 ——
+            # 界面一退出就删不掉那个目录（弹 Failed to remove temporary directory），
+            # 而且万一删掉了，正在跑的哨兵会当场崩。
+            subprocess.Popen(watch_cmd(), cwd=BASE_DIR, creationflags=NO_WINDOW,
+                             env=child_env())
         except Exception as e:
             self.set_status(f"启动失败：{e}", "#c00")
             return

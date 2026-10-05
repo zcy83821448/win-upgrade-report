@@ -325,6 +325,36 @@ def take_check_now():
     return False
 
 
+def child_env(extra=None):
+    """给「由我们派生出去的子进程」一份干净的环境变量。
+
+    ★ 这是踩了两次坑才定下来的，动之前先看完：
+
+    单文件 exe 启动时会把自己解包到 %TEMP%\\_MEIxxxx，并把这个路径写进环境变量
+    _MEIPASS2 交给它启动的子进程。子进程看到 _MEIPASS2 就**复用同一个目录、
+    不再自己解包**（PyInstaller 本来是为了省时间）。于是出两个问题：
+
+      1) 界面里点「开启后台监控」→ 派生出的哨兵住进了**界面的**临时目录。
+         界面一退出就去删那个目录，可哨兵还在里面跑着、DLL 还映射着，删不掉，
+         弹出：Warning  Failed to remove temporary directory: ...\\_MEIxxxx
+         万一哪次删成功了，还在跑的哨兵会当场崩。
+
+      2) 反过来，托盘的「打开设置界面」复用哨兵的目录；哨兵一退出把目录删了，
+         设置界面下次就起不来，报 Failed to start embedded python interpreter。
+
+    所以规矩很简单：**凡是我们自己派生我们的 exe / 我们的 .py，一定先把这个
+    变量摘掉**，让子进程解包自己的一份、自己管自己的目录，谁也不欠谁。
+    代价是每次派生多花 1~2 秒，换来绝对不出这类怪问题。
+    """
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith("_MEI") or k.startswith("_PYI"):
+            env.pop(k, None)
+    if extra:
+        env.update(extra)
+    return env
+
+
 def request_exit():
     """请哨兵「完全关闭」：设置界面和托盘菜单都走这里。"""
     try:

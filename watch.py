@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (load_config, load_state, load_watch, save_watch,   # noqa: E402
                     take_check_now, take_exit_request, request_check_now,
                     request_exit, patch_config, ensure_dirs, resource_path,
-                    BASE_DIR, LOG_DIR, is_frozen)
+                    child_env, BASE_DIR, LOG_DIR, is_frozen)
 import source                                                         # noqa: E402
 import gamesense                                                      # noqa: E402
 import checker                                                        # noqa: E402
@@ -91,23 +91,12 @@ def _pythonw():
 
 
 def _clean_env():
-    """给子进程一份干净的环境变量：把 PyInstaller 单文件版注入的那些去掉。
+    """给子进程一份干净的环境变量。
 
-    为什么必须去掉（这是实测踩到的坑）：
-        单文件 exe 启动时会把自己解包到 %TEMP%\\_MEIxxxx，并把这个路径写进
-        环境变量 _MEIPASS2 传给它启动的子进程。子进程看到 _MEIPASS2 就直接
-        **复用同一个目录、不再解包**（本来是为了快）。但这个目录是「谁解包谁负责删」：
-          * 哨兵一退出就把目录删了，而还在复用它的设置界面会当场崩掉；
-          * 复用期间目录被临时文件清理工具动过，新进程就会起不来，弹
-            「Failed to start embedded python interpreter!」（用户实测遇到过）。
-        所以这里干脆让子进程自己重新解包一份：多花 1~2 秒，换来绝对不会因为
-        共用临时目录而出问题。
+    实现就在 config.child_env()，两个地方共用同一份逻辑，免得以后只改一边。
+    完整原因（为什么要摘掉 _MEIPASS2）写在那个函数的注释里，值得看一眼。
     """
-    env = dict(os.environ)
-    for k in list(env):
-        if k.startswith("_MEI") or k.startswith("_PYI"):
-            env.pop(k, None)
-    return env
+    return child_env()
 
 
 def _spawn(args):
