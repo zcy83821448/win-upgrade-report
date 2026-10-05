@@ -279,18 +279,23 @@ class App:
         root.geometry(f"{WIN_W}x{WIN_H}")
         root.minsize(820, 560)
 
+        # ---- 顶部常驻状态卡片：不管在哪个标签页，都能一眼看到「它在不在跑」----
+        self._build_hero(root)
+
         nb = ttk.Notebook(root)
-        nb.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        nb.pack(fill="both", expand=True, padx=10, pady=(4, 4))
         self.t_chan = ttk.Frame(nb, padding=10)
         self.t_detect = ttk.Frame(nb, padding=12)
         self.t_api = ttk.Frame(nb, padding=12)
         self.t_task = ttk.Frame(nb, padding=12)
         self.t_log = ttk.Frame(nb, padding=12)
-        nb.add(self.t_chan, text="更新线")
-        nb.add(self.t_detect, text="检测与通知")
-        nb.add(self.t_api, text="DeepSeek API")
-        nb.add(self.t_task, text="计划任务")
-        nb.add(self.t_log, text="状态与日志")
+        # 标签名一律按「用户想干什么」起，不用实现细节：
+        # 「计划任务」「DeepSeek API」「并发线程数」这类词普通人不知道是什么。
+        nb.add(self.t_chan, text="  更新线  ")       # 我要盯哪几条线
+        nb.add(self.t_detect, text="  通知  ")       # 什么时候提醒我、怎么提醒
+        nb.add(self.t_api, text="  设置  ")          # AI 的 Key（必填）+ 高级选项
+        nb.add(self.t_task, text="  开机自启  ")     # 让它开机自己跑起来
+        nb.add(self.t_log, text="  日志与诊断  ")    # 出问题了看这里
         self.nb = nb
         self.log_tab = self.t_log
         nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
@@ -304,26 +309,24 @@ class App:
 
         bar = ttk.Frame(root, padding=(12, 0, 12, 4))
         bar.pack(fill="x")
-        self.status = ttk.Label(bar, text="", foreground="#0a6cff", wraplength=820,
+        self.status = ttk.Label(bar, text="", foreground="#0a6cff", wraplength=880,
                                 justify="left")
         self.status.pack(anchor="w")
 
         btns = ttk.Frame(root, padding=(12, 4, 12, 12))
         btns.pack(fill="x")
         ttk.Button(btns, text="保存设置", command=self.save).pack(side="left")
-        self.btn_check = ttk.Button(btns, text="立即检测全部（过程显示在日志里）",
+        self.btn_check = ttk.Button(btns, text="立刻检测一遍（过程显示在日志里）",
                                     command=lambda: self.run_check_live())
         self.btn_check.pack(side="left", padx=6)
-        self.btn_toast = ttk.Button(btns, text="发测试通知", command=self.test_toast)
+        self.btn_toast = ttk.Button(btns, text="发一条测试通知", command=self.test_toast)
         self.btn_toast.pack(side="left")
-        # 两种关闭方式：默认只关窗口（后台继续跑），另一个把后台监控彻底停掉
-        self.btn_quit_all = ttk.Button(btns, text="完全关闭后台监控",
-                                       command=self.quit_all)
+        # 关闭按钮的文字和可见性跟着后台状态走（见 refresh_status）：
+        # 后台没在跑的时候写「关闭到托盘」是误导 —— 那时候压根没有托盘图标。
+        self.btn_quit_all = ttk.Button(btns, text="完全退出", command=self.quit_all)
         self.btn_quit_all.pack(side="right")
-        self.btn_close = ttk.Button(btns, text="关闭到托盘",
-                                    command=self.close_to_tray)
+        self.btn_close = ttk.Button(btns, text="关闭窗口", command=self.close_to_tray)
         self.btn_close.pack(side="right", padx=6)
-        # 点窗口右上角的 × 也走「关闭到托盘」，并问一次要不要彻底关
         root.protocol("WM_DELETE_WINDOW", self.close_to_tray)
 
         self.reload_channels()
@@ -331,6 +334,72 @@ class App:
         self.refresh_status()
         self.refresh_task_info_async()      # 查计划任务要 2 秒，放后台
         self.root.after(100, self._poll_results)   # 主线程轮询后台结果
+
+    # ========================================== 顶部状态卡片（一眼看懂）
+    def _build_hero(self, root):
+        """最上面那块常驻区域：它在不在跑、在盯什么、还缺什么、一键开关。
+
+        为什么放最上面而不是塞进某个标签页：用户最想知道的其实只有一件事
+        ——「它现在到底有没有在帮我盯着」。这句话藏在第 4 个标签页里等于没有。
+        """
+        bg, line = "#f4f7fc", "#d8e2f2"
+        card = tk.Frame(root, bg=bg, highlightbackground=line,
+                        highlightthickness=1)
+        card.pack(fill="x", padx=10, pady=(10, 4))
+        inner = tk.Frame(card, bg=bg)
+        inner.pack(fill="x", padx=14, pady=11)
+        inner.columnconfigure(1, weight=1)
+
+        self.hero_dot = tk.Label(inner, text="○", bg=bg, fg="#98a2b3",
+                                 font=("Microsoft YaHei", 17))
+        self.hero_dot.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 8))
+        self.hero_title = tk.Label(inner, text="正在读状态…", bg=bg, fg="#111827",
+                                   font=("Microsoft YaHei", 13, "bold"))
+        self.hero_title.grid(row=0, column=1, sticky="w")
+        self.hero_sub = tk.Label(inner, text="", bg=bg, fg="#4b5563",
+                                 font=("Microsoft YaHei", 9), justify="left")
+        self.hero_sub.grid(row=1, column=1, sticky="w", pady=(3, 0))
+        self.hero_hint = tk.Label(inner, text="", bg=bg, fg="#b45309",
+                                  font=("Microsoft YaHei", 9), justify="left")
+        self.hero_hint.grid(row=2, column=1, sticky="w", pady=(4, 0))
+
+        right = tk.Frame(inner, bg=bg)
+        right.grid(row=0, column=2, rowspan=3, sticky="e")
+        self.btn_hero = ttk.Button(right, text="开启后台监控", width=15,
+                                   command=self.hero_toggle)
+        self.btn_hero.pack(anchor="e")
+        row2 = tk.Frame(right, bg=bg)
+        row2.pack(anchor="e", pady=(6, 0))
+        ttk.Button(row2, text="立刻检查", width=9,
+                   command=lambda: self.run_silent(["--force"])
+                   ).pack(side="left")
+        ttk.Button(row2, text="看报告", width=9,
+                   command=self.open_index).pack(side="left", padx=(6, 0))
+
+    def hero_toggle(self):
+        """顶部那个开关：开 / 停后台监控。"""
+        if load_watch().get("online"):
+            self.stop_watch()
+            self.set_status("已停止后台监控，托盘图标几秒内消失。")
+            self.root.after(1800, self.refresh_status)
+            return
+        if not resolve_api_key(self.cfg):
+            self.set_status("先去「设置」页填一个 AI 的 Key —— "
+                            "不填的话就算发现新版本也写不出中文报告。", "#b45309")
+            try:
+                self.nb.select(self.t_api)
+            except Exception:
+                pass
+            return
+        self.start_watch()
+
+    def stop_watch(self):
+        """停掉后台哨兵（但不关窗口）。"""
+        self.cfg["watch_enabled"] = False      # 内存里也同步，免得之后保存设置写回旧值
+        if load_watch().get("online"):
+            # 先关开关再发退出请求：即使计划任务把它重启，它一启动就自己退了
+            patch_config(watch_enabled=False)
+            request_exit()
 
     def _fit_window(self):
         """按内容的实际需要定窗口大小，保证每个标签页都完整显示。
@@ -450,15 +519,18 @@ class App:
 
     # ======================================================== 更新线
     def _build_chan(self, p):
+        ttk.Label(p, text="这里决定它帮你盯哪几条 Windows 更新线。"
+                          "至少勾一条，它才有东西可查。",
+                  foreground="#4b5563", justify="left").pack(anchor="w", pady=(0, 6))
         top = ttk.Frame(p)
         top.pack(fill="x")
-        ttk.Label(top, text="监控哪些更新线", font=("", 11, "bold")).pack(side="left")
-        self.btn_discover = ttk.Button(top, text="从 Flight Hub 刷新频道列表",
+        ttk.Label(top, text="要盯的更新线", font=("", 11, "bold")).pack(side="left")
+        self.btn_discover = ttk.Button(top, text="刷新一下可选的线",
                                        command=self.discover)
         self.btn_discover.pack(side="right")
-        ttk.Label(p, text="双击一行 = 启用/停用；选中一行在下面看详情。"
-                          "Insider 线来自微软 Flight Hub，uupdump 线用于正式版/零售版本。",
-                  foreground="#888").pack(anchor="w", pady=(2, 6))
+        ttk.Label(p, text="勾选 = 盯这条线（双击一行也行，选中一行在下面看详情）。\n"
+                          "一般只勾你正在用的那条就够了；不确定就留着默认那条。",
+                  foreground="#888", justify="left").pack(anchor="w", pady=(2, 6))
 
         mid = ttk.Frame(p)
         mid.pack(fill="both", expand=True)
@@ -766,74 +838,76 @@ class App:
         return cb
 
     def _build_detect(self, p):
-        # ---------- 哨兵：每隔几分钟问一次官方看板 ----------
-        self._check(p, 0, "开启后台监控（哨兵常驻：登录后一直开着，托盘有图标）",
-                    "watch_enabled")
-        self._entry(p, 1, "每隔几分钟看一次", "watch_interval_minutes", 6,
-                    "只问「官网变了没有」；没变化时传输 0 字节，也不调 AI")
-        ttk.Label(p, text="官方看板一变，就抓发布说明 → 让 AI 写成中文报告 → 弹一条通知。\n"
-                          "从「官网发布」到「你收到通知」通常 2～5 分钟"
-                          "（其中 AI 总结约占 30～90 秒）。\n"
-                          "没新版本时不发任何通知，日志也不刷。\n"
-                          "右下角托盘图标可以随时看状态、立刻检测、或者完全关掉它。",
-                  foreground="#888", justify="left").grid(row=2, column=1, columnspan=2,
-                                                          sticky="w", pady=(0, 8))
+        """「通知」页：什么时候提醒我、怎么提醒。"""
+        ttk.Label(p, text="这一页管两件事：多久查一次、以及它什么时候出声打扰你。",
+                  foreground="#4b5563", justify="left"
+                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        # ---------- 玩游戏时彻底静默 ----------
-        self._check(p, 3, "玩游戏时彻底静默（不联网、不调 AI、不通知、不写盘）",
+        self._entry(p, 1, "多久检查一次（分钟）", "watch_interval_minutes", 6)
+        ttk.Label(p, text="只问微软「官网变了没有」。没变化时对方只回一句「没变」，"
+                          "不下载任何东西、也不花 AI 的钱。\n"
+                          "所以 5 分钟一次几乎零成本。想更快就改小，最小 1 分钟。",
+                  foreground="#888", justify="left"
+                  ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 6))
+
+        ttk.Separator(p, orient="horizontal").grid(row=3, column=0, columnspan=3,
+                                                   sticky="ew", pady=8)
+        self._check(p, 4, "发现新版本时，弹一条通知告诉我", "notify")
+        self._check(p, 5, "一次发现好几条时，合并成一条通知", "merge_notifications")
+        self._entry(p, 6, "连续失败几次后提醒我", "notify_on_error_after", 6,
+                    "0 = 出错了也不提醒")
+        self._entry(p, 7, "这些时间段别打扰我", "quiet_hours", 16)
+        ttk.Label(p, text="填成 23:00-07:00 这种形式。这段时间里发现的新版本会先攒着，"
+                          "过了时段再补一条通知；留空就是不限。",
+                  foreground="#888", justify="left"
+                  ).grid(row=8, column=1, columnspan=2, sticky="w", pady=(0, 4))
+
+        ttk.Separator(p, orient="horizontal").grid(row=9, column=0, columnspan=3,
+                                                   sticky="ew", pady=8)
+        self._check(p, 10, "玩游戏时完全安静（不联网、不调 AI、不弹通知）",
                     "game_mode_enabled")
-        self._entry(p, 4, "游戏关闭后确认几秒才恢复", "game_exit_hold_seconds", 6,
-                    "防止切进切出时通知乱弹；恢复后会立刻补查一次")
-        ttk.Label(p, text="判定方式：有窗口铺满整块屏幕 + 没有标题栏 + 不是系统组件/叠加层。\n"
-                          "（无边框全屏的游戏正好符合这个形状。）",
-                  foreground="#888", justify="left").grid(row=5, column=1, columnspan=2,
-                                                          sticky="w", pady=(0, 4))
+        self._entry(p, 11, "退出游戏后确认几秒才恢复", "game_exit_hold_seconds", 6,
+                    "防止切进切出时通知乱弹")
+        ttk.Label(p, text="怎么认出来的：有窗口铺满整块屏幕 + 没有标题栏 + 不是系统组件。"
+                          "无边框全屏的游戏正好符合。\n"
+                          "认错了就点下面「把当前程序加进忽略名单」，或者手动静默一会儿。",
+                  foreground="#888", justify="left"
+                  ).grid(row=12, column=1, columnspan=2, sticky="w", pady=(0, 4))
         self.btn_quiet = ttk.Button(p, text="现在静默 2 小时（手动）",
                                     command=self.quiet_now)
-        self.btn_quiet.grid(row=6, column=1, sticky="w", pady=(0, 2))
-        self.btn_ignore = ttk.Button(p, text="把当前前台程序加进忽略名单",
+        self.btn_quiet.grid(row=13, column=1, sticky="w", pady=(0, 2))
+        self.btn_ignore = ttk.Button(p, text="把当前正在用的程序加进忽略名单",
                                      command=self.ignore_foreground)
-        self.btn_ignore.grid(row=6, column=2, sticky="w", padx=6, pady=(0, 2))
+        self.btn_ignore.grid(row=13, column=2, sticky="w", padx=6, pady=(0, 2))
         self.quiet_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
-        self.quiet_lbl.grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        self.quiet_lbl.grid(row=14, column=1, columnspan=2, sticky="w", pady=(0, 6))
 
-        ttk.Separator(p, orient="horizontal").grid(row=8, column=0, columnspan=3,
+        ttk.Separator(p, orient="horizontal").grid(row=15, column=0, columnspan=3,
                                                    sticky="ew", pady=8)
-        # ---------- 通知 ----------
-        self._check(p, 9, "发现新版本时发 Windows 通知", "notify")
-        self._check(p, 10, "多条线同时更新时合并成一条通知", "merge_notifications")
-        self._entry(p, 11, "连续失败几次后通知我", "notify_on_error_after", 6,
-                    "0 = 出错也不通知")
-        self._entry(p, 12, "静默时段", "quiet_hours", 16,
-                    "例如 23:00-07:00：这期间先攒着不出声，出了时段再补发；留空则不限")
-        ttk.Separator(p, orient="horizontal").grid(row=13, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        ttk.Label(p, text="报告详细程度").grid(row=14, column=0, sticky="w", pady=3)
-        self.detail_var = tk.StringVar(value=self.cfg.get("detail") or "标准")
-        ttk.Combobox(p, textvariable=self.detail_var, state="readonly", width=8,
-                     values=list(deepseek_api.DETAIL_SPEC.keys())
-                     ).grid(row=14, column=1, sticky="w", padx=6)
-        self._check(p, 15, "报告末尾附上官方原文全文", "include_official_text")
-        self._entry(p, 16, "每个频道最多保留报告数", "keep_reports", 8)
-        self._check(p, 17, "自动收录 Flight Hub 上新出现的更新线（默认不启用）",
-                    "auto_discover_channels")
-
-        # ---------- 托盘图标样式 ----------
-        ttk.Separator(p, orient="horizontal").grid(row=18, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        ttk.Label(p, text="任务栏图标样式").grid(row=19, column=0, sticky="w", pady=3)
+        ttk.Label(p, text="右下角托盘图标长什么样").grid(row=16, column=0, sticky="w",
+                                                        pady=3)
         self.tray_style_var = tk.StringVar()
         self.tray_combo = ttk.Combobox(p, textvariable=self.tray_style_var,
                                        state="readonly", width=16)
-        self.tray_combo.grid(row=19, column=1, sticky="w", padx=6)
+        self.tray_combo.grid(row=16, column=1, sticky="w", padx=6)
         self.tray_combo.bind("<<ComboboxSelected>>", self.on_tray_style)
-        ttk.Label(p, text="换完立刻生效，不用重启哨兵", foreground="#888"
-                  ).grid(row=19, column=2, sticky="w")
+        ttk.Label(p, text="换完立刻生效，不用重启", foreground="#888"
+                  ).grid(row=16, column=2, sticky="w")
         self.tray_prev_lbl = ttk.Label(p, text="")
-        self.tray_prev_lbl.grid(row=20, column=1, sticky="w", pady=(4, 0))
+        self.tray_prev_lbl.grid(row=17, column=1, sticky="w", pady=(4, 0))
         self._tray_prev_img = None
         self._tray_style_map = {}
         self._build_tray_style_list()
+
+        ttk.Separator(p, orient="horizontal").grid(row=18, column=0, columnspan=3,
+                                                   sticky="ew", pady=8)
+        ttk.Label(p, text="中文报告写多详细").grid(row=19, column=0, sticky="w", pady=3)
+        self.detail_var = tk.StringVar(value=self.cfg.get("detail") or "标准")
+        ttk.Combobox(p, textvariable=self.detail_var, state="readonly", width=8,
+                     values=list(deepseek_api.DETAIL_SPEC.keys())
+                     ).grid(row=19, column=1, sticky="w", padx=6)
+        self._check(p, 20, "报告末尾附上官方原文全文", "include_official_text")
+        self._entry(p, 21, "每份报告最多保留几份", "keep_reports", 8)
 
     # ---- 托盘图标样式
     def _build_tray_style_list(self):
@@ -933,76 +1007,113 @@ class App:
 
     # ======================================================== API
     def _build_api(self, p):
-        self._entry(p, 0, "API 地址", "api_base")
-        self._entry(p, 1, "模型名称", "model")
-        e = self._entry(p, 2, "API Key", "api_key", 44,
-                        "直接在框里粘贴你的 Key，保存在本机 config.json 里", show="•")
+        """「设置」页：AI 的 Key（必填）放最前面，专业参数一律收到下面去。"""
+        ttk.Label(p, text="必填的一项：让 AI 把微软的英文发布说明写成中文报告",
+                  foreground="#111827", font=("Microsoft YaHei", 11, "bold")
+                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        e = self._entry(p, 1, "AI 的 Key", "api_key", 44, show="•")
         self.show_key = tk.BooleanVar(value=False)
         ttk.Checkbutton(p, text="显示", variable=self.show_key,
                         command=lambda: e.config(show="" if self.show_key.get() else "•")
-                        ).grid(row=2, column=3, sticky="w", padx=4)
-        self._check(p, 3, "关闭思考模式（thinking.type = disabled）", "disable_thinking")
-        self._entry(p, 4, "max_tokens", "max_tokens", 8)
-        self._entry(p, 5, "temperature", "temperature", 8)
-        self._entry(p, 6, "请求超时（秒）", "request_timeout", 8)
-        self._entry(p, 7, "网络重试次数", "retries", 6)
-        self._entry(p, 8, "并发抓取线程数", "max_workers", 6,
-                    "同时抓几条更新线；1 = 串行。只有多条 uupdump 线时才有区别")
-        self._entry(p, 9, "代理（可选）", "proxy", 30, "例如 http://127.0.0.1:7897；留空直连")
-        self._entry(p, 10, "喂给模型的官网原文上限（字符）", "max_context_chars", 10)
-        self.btn_apitest = ttk.Button(p, text="测试 Key 与模型", command=self.test_api)
-        self.btn_apitest.grid(row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
+                        ).grid(row=1, column=3, sticky="w", padx=4)
+        ttk.Label(p, text="去哪拿：登录 platform.deepseek.com → 左侧「API keys」→ 新建一个，"
+                          "复制过来粘在上面。\n"
+                          "它只保存在你自己电脑上的 config.json 里，不会上传到任何地方。",
+                  foreground="#888", justify="left"
+                  ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(0, 8))
+        self.btn_apitest = ttk.Button(p, text="点这里测一下 Key 能不能用",
+                                      command=self.test_api)
+        self.btn_apitest.grid(row=3, column=1, sticky="w", pady=(0, 4))
 
-    # ======================================================== 计划任务
+        ttk.Separator(p, orient="horizontal").grid(row=4, column=0, columnspan=4,
+                                                   sticky="ew", pady=10)
+        ttk.Label(p, text="—— 以下是高级选项，正常用不需要动 ——",
+                  foreground="#98a2b3").grid(row=5, column=0, columnspan=4,
+                                             sticky="w", pady=(0, 4))
+        self._entry(p, 6, "AI 服务地址", "api_base")
+        self._entry(p, 7, "模型名称", "model")
+        self._check(p, 8, "关闭思考模式", "disable_thinking")
+        self._entry(p, 9, "单次回答最多多少词", "max_tokens", 8)
+        self._entry(p, 10, "随机程度 temperature", "temperature", 8)
+        self._entry(p, 11, "网络超时（秒）", "request_timeout", 8)
+        self._entry(p, 12, "失败重试几次", "retries", 6)
+        self._entry(p, 13, "同时抓几条线", "max_workers", 6, "1 = 一条一条抓")
+        self._entry(p, 14, "代理（可选，一般留空）", "proxy", 30,
+                    "例如 http://127.0.0.1:7897")
+        self._entry(p, 15, "喂给 AI 的原文上限（字符）", "max_context_chars", 10)
+        self._check(p, 16, "自动收录微软看板上新出现的更新线（默认不启用）",
+                    "auto_discover_channels")
+
+    # ======================================================== 开机自启
     def _build_task(self, p):
-        ttk.Label(p, text="计划任务名").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Label(p, text=TASK_NAME).grid(row=0, column=1, sticky="w", padx=6)
-        self.task_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
-        self.task_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 10))
+        """「开机自启」页：让它在后台一直盯着。
+
+        两种办法，**不需要管理员权限的那个放第一位** —— 这才是普通人该走的路。
+        计划任务更稳（崩了自动重启），但要弹 UAC，所以算「办法二」。
+        """
+        ttk.Label(p, text="想让它在后台一直盯着（右下角一直有托盘图标），"
+                          "下面两种办法任选一种就行。",
+                  foreground="#4b5563", justify="left"
+                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        ttk.Label(p, text="办法一（推荐）：开机自动启动　·　不需要管理员权限",
+                  foreground="#111827", font=("Microsoft YaHei", 11, "bold")
+                  ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 2))
+        self.btn_startup = ttk.Button(p, text="一键设置开机自启", command=self.toggle_startup)
+        self.btn_startup.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ttk.Label(p, text="原理就是往「启动」文件夹里放个快捷方式，登录时自动把它跑起来。"
+                          "不用管理员权限，不会弹窗。",
+                  foreground="#888", justify="left"
+                  ).grid(row=3, column=0, columnspan=4, sticky="w")
+        self.startup_lbl = ttk.Label(p, text="", foreground="#333")
+        self.startup_lbl.grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 10))
+
+        ttk.Label(p, text="办法二：装成 Windows 计划任务　·　更稳，但会弹一次 UAC",
+                  foreground="#111827", font=("Microsoft YaHei", 11, "bold")
+                  ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 2))
         self.btn_task_install = ttk.Button(p, text="安装 / 更新计划任务",
                                            command=self.install_task)
-        self.btn_task_install.grid(row=2, column=0, sticky="w")
+        self.btn_task_install.grid(row=6, column=0, sticky="w")
         self.btn_task_remove = ttk.Button(p, text="删除计划任务",
                                           command=self.remove_task)
-        self.btn_task_remove.grid(row=2, column=1, sticky="w", padx=6)
-        ttk.Label(p, text="（注册计划任务要管理员权限，会弹一次 UAC）",
-                  foreground="#888").grid(row=2, column=2, sticky="w")
-        ttk.Label(p, text=("这个任务干什么：登录时悄悄启动哨兵，一直开着；每几分钟问一次官方\n"
-                           "看板，只有真出了新版本才通知你。任务设成「不限时 + 崩了自动重启」，\n"
-                           "不会被系统定时杀掉。安装时会顺手把旧的每日任务卸掉（已不需要）。"),
-                  foreground="#333", justify="left").grid(row=3, column=0, columnspan=4,
-                                                          sticky="w", pady=(8, 2))
+        self.btn_task_remove.grid(row=6, column=1, sticky="w", padx=6)
+        ttk.Label(p, text="（点的时候会弹一次 UAC，点「是」就行）",
+                  foreground="#888").grid(row=6, column=2, columnspan=2, sticky="w")
+        ttk.Label(p, text="好处是它「不限时 + 崩了自动重启」，不会被系统定时杀掉，"
+                          "比办法一更不容易断。",
+                  foreground="#888", justify="left"
+                  ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.task_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
+        self.task_lbl.grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 6))
         self.logon_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
-        self.logon_lbl.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Button(p, text="刷新哨兵状态", command=self.refresh_logon_hint
-                   ).grid(row=5, column=0, sticky="w", pady=6)
-        ttk.Button(p, text="立刻静默跑一次（手动检测）",
-                   command=lambda: self.run_silent(["--force"])
-                   ).grid(row=5, column=1, columnspan=2, sticky="w")
-        ttk.Button(p, text="启动后台监控", command=self.start_watch
-                   ).grid(row=5, column=3, sticky="w")
-        self.btn_startup = ttk.Button(p, text="装/卸 登录自启（免管理员备用）",
-                                      command=self.toggle_startup)
-        self.btn_startup.grid(row=6, column=0, columnspan=2, sticky="w")
-        self.startup_lbl = ttk.Label(p, text="", foreground="#333")
-        self.startup_lbl.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Separator(p, orient="horizontal").grid(row=8, column=0, columnspan=4,
-                                                   sticky="ew", pady=10)
-        ttk.Label(p, text="程序目录").grid(row=9, column=0, sticky="w")
-        ttk.Label(p, text=BASE_DIR, foreground="#666").grid(row=9, column=1, columnspan=3,
-                                                            sticky="w")
-        ttk.Label(p, text="运行方式").grid(row=10, column=0, sticky="w")
-        _exe, _args = watch_target()
-        ttk.Label(p, text=f"{_exe} {_args}", foreground="#666").grid(
-            row=10, column=1, columnspan=3, sticky="w")
-        ttk.Button(p, text="注册通知 / 协议", command=self.reg).grid(row=11, column=0,
-                                                                    sticky="w", pady=8)
+        self.logon_lbl.grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+        ttk.Button(p, text="现在就跑起来（不等下次开机）", command=self.start_watch
+                   ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Separator(p, orient="horizontal").grid(row=11, column=0, columnspan=4,
+                                                   sticky="ew", pady=8)
+        ttk.Label(p, text="—— 以下是给排查用的，正常用不到 ——",
+                  foreground="#98a2b3").grid(row=12, column=0, columnspan=4,
+                                             sticky="w", pady=(0, 4))
+        ttk.Button(p, text="刷新后台状态", command=self.refresh_logon_hint
+                   ).grid(row=13, column=0, sticky="w", pady=4)
+        ttk.Button(p, text="注册通知 / 协议", command=self.reg
+                   ).grid(row=13, column=1, sticky="w", pady=4)
         ttk.Button(p, text="在桌面放快捷方式",
-                   command=lambda: self.make_shortcut("desktop")).grid(row=11, column=1,
-                                                                       sticky="w")
+                   command=lambda: self.make_shortcut("desktop")
+                   ).grid(row=13, column=2, sticky="w", pady=4)
         ttk.Button(p, text="放进开始菜单",
-                   command=lambda: self.make_shortcut("startmenu")).grid(row=11, column=2,
-                                                                         sticky="w")
+                   command=lambda: self.make_shortcut("startmenu")
+                   ).grid(row=13, column=3, sticky="w", pady=4)
+        _exe, _args = watch_target()
+        ttk.Label(p, text="程序目录：" + BASE_DIR, foreground="#98a2b3"
+                  ).grid(row=14, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(p, text="运行方式：" + _exe + " " + _args, foreground="#98a2b3"
+                  ).grid(row=15, column=0, columnspan=4, sticky="w")
+        ttk.Label(p, text="任务名：" + TASK_NAME, foreground="#98a2b3"
+                  ).grid(row=16, column=0, columnspan=4, sticky="w")
         self.refresh_logon_hint()
 
     # ---- 哨兵状态
@@ -1011,37 +1122,46 @@ class App:
         try:
             w = load_watch()
             if w.get("online"):
-                mode = {"game": "游戏静默中", "paused": "已暂停（没启用）"}.get(
-                    w.get("mode"), "正常")
-                txt = (f"哨兵：运行中（进程 {w.get('pid')}）　状态：{mode}\n"
-                       f"上次问官方：{w.get('last_check') or '还没问过'}"
-                       f"　上次有新版本：{w.get('last_change') or '还没有过'}"
-                       f"　间隔：每 {w.get('interval_minutes')} 分钟"
-                       f"　累计检测 {w.get('checks')} 次")
-                txt += ("\n托盘图标：已挂上（任务栏右下角；"
-                        "看不到就点那个 ∧ 展开，或者右键「显示隐藏的图标」）"
+                mode = {"game": "你正在玩游戏，它先不打扰你", "paused": "已暂停（没启用）"
+                        }.get(w.get("mode"), "正常")
+                txt = (f"后台现在：正在运行　（{mode}）\n"
+                       f"上次问微软：{w.get('last_check') or '还没问过'}"
+                       f"　　上次发现新版本：{w.get('last_change') or '还没有过'}"
+                       f"　　累计检查 {w.get('checks')} 次")
+                txt += ("\n托盘图标：已经在右下角了"
                         if w.get("tray") else
-                        "\n托盘图标：没挂上（不影响检测，看 logs\\checker.log 里的原因）")
-                txt += ("\n　「设置 → 个性化 → 任务栏 → 其他系统托盘图标」里"
-                        "把 win升级报告 打开，它就会一直显示")
+                        "\n托盘图标：没挂上（不影响检测，原因写在下面的日志里）")
+                if w.get("tray"):
+                    txt += ("（看不到就先点任务栏那个 ∧ 展开；"
+                            "想让它一直显示：设置 → 个性化 → 任务栏 → "
+                            "其他系统托盘图标 → 把 win升级报告 打开）")
                 if w.get("game_exe"):
-                    txt += f"\n因为检测到全屏程序而静默：{w.get('game_exe')}"
+                    txt += f"\n现在因为检测到全屏程序而安静：{w.get('game_exe')}"
                 if w.get("manual_until"):
                     txt += f"\n手动静默到：{w.get('manual_until')}"
                 if w.get("last_result"):
-                    txt += f"\n最近结果：{w.get('last_result')}"
+                    txt += f"\n最近一次结果：{w.get('last_result')}"
             else:
-                txt = ("哨兵：没有在运行。\n"
-                       "· 点上面「启动后台监控」立刻起来，不用等下次开机\n"
-                       "· 想让它以后每次登录自动起，就点「安装 / 更新计划任务」\n"
-                       "· 起来之后任务栏右下角会出现托盘图标"
-                       "（可能在「隐藏的图标」∧ 里面）")
+                txt = ("后台现在：没有在运行。\n"
+                       "· 点上面「现在就跑起来」立刻起来，不用等下次开机\n"
+                       "· 想让它以后开机自己起：走上面的「办法一」最省事（不用管理员权限）")
             self.logon_lbl.configure(text=txt)
+            try:
+                on = os.path.exists(startup_link())
+                self.btn_startup.configure(
+                    text="取消开机自启" if on else "一键设置开机自启")
+                self.startup_lbl.configure(
+                    text=("开机自启：已开启　→ 以后每次登录都会自动跑起来"
+                          if on else "开机自启：未开启"))
+            except Exception:
+                pass
         except Exception:
             pass
 
     # ======================================================== 日志
     def _build_log(self, p):
+        ttk.Label(p, text="平时不用看这一页。它没动静、或者你想确认它到底查了没有，再来这里。",
+                  foreground="#4b5563", justify="left").pack(anchor="w", pady=(0, 6))
         top = ttk.Frame(p)
         top.pack(fill="x")
         ttk.Button(top, text="刷新", command=self.refresh_status).pack(side="left")
@@ -1208,32 +1328,27 @@ class App:
 
     # ================================================== 两种关闭方式
     def close_to_tray(self):
-        """「关闭到托盘」：只关这个窗口，后台哨兵继续跑（托盘图标还在）。
+        """「关闭窗口」：只关窗口，后台监控照旧（托盘图标还在）。
 
-        点窗口右上角的 × 也是同一个行为。
-        **不弹确认框** —— 界面上已经有两个按钮各自写清楚了，点哪个就干哪个：
-            「关闭到托盘」      = 只关窗口
-            「完全关闭后台监控」 = 连后台一起停
+        点窗口右上角的 × 也是同一个行为。不弹确认框。
         """
         self.root.destroy()
 
     def quit_all(self):
-        """「完全关闭」：先关掉总开关，再请哨兵退出，然后关窗口。
+        """「完全退出」：连后台监控一起停掉，再关窗口。
 
-        同样不弹确认框。哨兵最多 5 秒内退出，托盘图标随之消失。
+        不弹确认框。哨兵最多 5 秒内退出，托盘图标随之消失。
+        下次想恢复：顶部那个「开启后台监控」按钮，或者重开本程序。
         """
-        if load_watch().get("online"):
-            # 先关开关再发退出请求：这样即使计划任务把它重启，
-            # 它一启动看到开关是关的就自己退了，不会「关了又自己回来」
-            patch_config(watch_enabled=False)
-            request_exit()
+        self.stop_watch()
         self.root.destroy()
 
     def start_watch(self):
-        """重新打开后台监控（对应「完全关闭」）。"""
+        """把后台监控跑起来（顶部那个开关也走这里）。"""
+        self.cfg["watch_enabled"] = True
         patch_config(watch_enabled=True)
         if load_watch().get("online"):
-            self.set_status("后台哨兵已经在运行了，托盘图标应该就在右下角。")
+            self.set_status("后台已经在跑了 —— 右下角那个托盘图标就是它。")
             self.refresh_status()
             return
         try:
@@ -1241,8 +1356,9 @@ class App:
         except Exception as e:
             self.set_status(f"启动失败：{e}", "#c00")
             return
-        self.set_status("已启动后台哨兵，几秒后右下角会出现托盘图标"
-                        "（如果没看到，可能先藏在任务栏的「隐藏的图标」里）。")
+        self.set_status("已经启动，几秒后右下角会出现托盘图标。"
+                        "（要是没看到，点任务栏那个 ∧ 展开一下，"
+                        "或者在「设置 → 个性化 → 任务栏 → 其他系统托盘图标」里把它打开）")
         self.root.after(2500, self.refresh_status)
         self.root.after(2500, self.refresh_logon_hint)
 
@@ -1373,18 +1489,68 @@ class App:
         pend = len(st.get("pending_notify") or [])
         logon_date = st.get("last_logon_date") or ""
 
-        # 哨兵现在怎么样（有没有在跑、是不是因为游戏静默了）
+        # ---- 顶部状态卡片：一眼看懂「它在不在跑」 ----
         w = load_watch()
-        if w.get("online"):
+        online = bool(w.get("online"))
+        gaming = (w.get("mode") == "game")
+        if online and gaming:
+            dot, color = "●", "#d97706"
+            title = "后台正在运行　（你正在玩游戏，它先不打扰你）"
+        elif online:
+            dot, color = "●", "#16a34a"
+            title = "后台正在运行"
+        else:
+            dot, color = "○", "#98a2b3"
+            title = "后台没在运行"
+        names = [c["name"] for c in self.cfg.get("channels", []) if c["enabled"]]
+        mins = w.get("interval_minutes") or self.cfg.get("watch_interval_minutes") or 5
+        sub = "正在盯着：" + ("、".join(names) if names else "（还没有勾任何更新线）")
+        sub += f"　　每 {mins} 分钟查一次"
+        if w.get("last_check"):
+            sub += f"　　上次检查 {w['last_check'][11:16]}"
+        if w.get("last_change"):
+            sub += f"　　上次发现新版本 {w['last_change'][:10]}"
+        self.hero_dot.configure(text=dot, fg=color)
+        self.hero_title.configure(text=title, fg="#111827")
+        self.hero_sub.configure(text=sub)
+
+        # 「还差什么才能用」——按顺序列出来，普通人照着做就行
+        todo = []
+        if not names:
+            todo.append("到「更新线」页勾一条要盯的线")
+        if not resolve_api_key(self.cfg):
+            todo.append("到「设置」页填一个 AI 的 Key（不填写不出中文报告）")
+        if not online:
+            todo.append("点右上角「开启后台监控」，它就开始盯着了")
+        if len(todo) > 1:          # 只有一条时别加序号，免得出现孤零零的「③」
+            marks = "①②③④⑤⑥"
+            todo = [f"{marks[i]}{t}" for i, t in enumerate(todo)]
+        self.hero_hint.configure(text="　".join(todo))
+        try:
+            self.btn_hero.configure(text="停止后台监控" if online
+                                    else "开启后台监控")
+            # 关闭按钮跟着状态走：后台没在跑时「关闭到托盘」是误导（那时没有图标）
+            if online:
+                self.btn_close.configure(text="关闭窗口（后台继续跑）")
+                self.btn_quit_all.configure(text="完全退出（连后台一起停）")
+                self.btn_quit_all.pack(side="right")
+            else:
+                self.btn_close.configure(text="关闭窗口")
+                self.btn_quit_all.pack_forget()
+        except Exception:
+            pass
+
+        # 哨兵现在怎么样（有没有在跑、是不是因为游戏静默了）
+        if online:
             mode = {"game": "游戏静默中", "paused": "已暂停（没启用）"}.get(
                 w.get("mode"), "正常")
-            watch_txt = (f"哨兵：运行中　状态：{mode}　"
+            watch_txt = (f"后台：运行中　状态：{mode}　"
                          f"上次问官方：{w.get('last_check') or '还没问过'}　"
                          f"每 {w.get('interval_minutes')} 分钟一次　"
                          + ("托盘图标：已挂上" if w.get("tray") else "托盘图标：没挂上"))
         else:
-            watch_txt = ("哨兵：没有在运行　→ 到「计划任务」页点「启动后台监控」"
-                         "立刻起来（起来了右下角会有托盘图标）")
+            watch_txt = ("后台：没有在运行　→ 点最上面那个「开启后台监控」，"
+                         "或者到「开机自启」页设置成开机自动运行")
 
         sumtxt = (watch_txt + "\n"
                   + "上次运行：" + (st.get("last_run_date") or "从未")
@@ -1417,12 +1583,7 @@ class App:
             pass
 
         self.task_lbl.configure(text=self._task_text)
-        self.refresh_logon_hint()
-        try:
-            self.startup_lbl.configure(
-                text="登录自启：" + ("已开启" if os.path.exists(startup_link()) else "未开启"))
-        except Exception:
-            pass
+        self.refresh_logon_hint()      # 里面会把「开机自启」的状态一起刷新
         try:
             if self.nb.nametowidget(self.nb.select()) is self.log_tab:
                 self.load_log()
