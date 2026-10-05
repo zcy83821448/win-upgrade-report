@@ -37,6 +37,7 @@ import os
 import sys
 import time
 import ctypes
+import threading
 import subprocess
 import datetime as dt
 import traceback
@@ -65,6 +66,10 @@ NO_WINDOW = 0x08000000
 # 读的一方拿到的要么是旧的要么是新的，不会读到写了一半的状态。
 STATE = {"mode": "normal", "last_check": "", "game_exe": "",
          "interval": 5, "silent": False}
+
+# 托盘实例。菜单动作（比如「设置界面没起来」时弹个气泡）要用到它，
+# 所以放在模块级；没挂托盘时就是 None。
+TRAY = None
 
 
 def say(msg, level="INFO"):
@@ -123,11 +128,88 @@ def open_program_folder():
         return False
 
 
+def _run_selfcheck_bg():
+    """托盘菜单「体检并自动修复」：跑完把结果压缩成一句气泡。
+
+    体检会真的去连一次网、还可能启停哨兵，所以放到线程里跑，别卡住托盘。
+    """
+    try:
+        import selfcheck
+        res = selfcheck.check_all(fix=True)
+        head = selfcheck.summary(res)
+        say("体检：" + head)
+        bad = [r for r in res if r["status"] in ("warn", "fail")]
+        msg = head
+        if bad:
+            msg += "\n" + bad[0]["msg"]
+        if TRAY is not None:
+            try:
+                TRAY.balloon("体检完成", msg[:250])
+            except Exception:
+                pass
+    except Exception as e:
+        say(f"体检出错：{type(e).__name__}: {e}", "WARN")
+
+
+def _settings_windows():
+    """当前有没有「win升级报告」的设置窗口（标题精确相等，排除 DSH 那个长标题）。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.windll.user32
+    out = []
+
+    def cb(hwnd, _):
+        if not u32.IsWindowVisible(hwnd):
+            return True
+        n = u32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return True
+        b = ctypes.create_unicode_buffer(n + 1)
+        u32.GetWindowTextW(hwnd, b, n + 1)
+        if b.value.strip() == "win升级报告":
+            out.append(hwnd)
+        return True
+
+    try:
+        u32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+    except Exception:
+        pass
+    return out
+
+
+def _verify_settings_opened():
+    """派生设置界面之后盯一会儿：要是没起来，自己兜底。
+
+    为什么要这么做：单文件版「再跑一次自己」有不小的概率起不来
+    （临时目录被清理软件动过、解包失败……），用户看到的是一句
+    「Failed to start embedded python interpreter!」—— 这既看不懂也没法处理。
+    成熟一点的做法是自己发现「没起来」，然后把程序文件夹打开、
+    用人话说一句「双击里面的 exe 就行」，别让用户卡在那儿。
+    """
+    for _ in range(25):                 # 最多等 25 秒（单文件版解包要约 2 秒）
+        time.sleep(1)
+        if _settings_windows():
+            return True
+    say("设置界面没能自己起来，改为打开程序文件夹让用户手动双击 exe", "WARN")
+    open_program_folder()
+    if TRAY is not None:
+        try:
+            TRAY.balloon("设置界面没能打开",
+                         "已经帮你打开程序文件夹了，双击里面的 win升级报告.exe 就行。")
+        except Exception:
+            pass
+    return False
+
+
 def open_settings():
     """从托盘打开设置界面（打包后就是再跑一次自己，不带参数）。"""
     if is_frozen():
-        return _spawn([sys.executable])
-    return _spawn([_pythonw(), os.path.join(BASE_DIR, "gui.py")])
+        ok = _spawn([sys.executable])
+    else:
+        ok = _spawn([_pythonw(), os.path.join(BASE_DIR, "gui.py")])
+    if ok:
+        threading.Thread(target=_verify_settings_opened, daemon=True).start()
+    return ok
 
 
 def open_viewer(arg="index"):
@@ -172,6 +254,7 @@ def tray_menu():
         {"sep": True},
         {"id": "index", "label": "打开报告总览"},
         {"id": "log", "label": "打开日志"},
+        {"id": "selfcheck", "label": "体检并自动修复"},
         {"id": "folder", "label": "打开程序文件夹（界面打不开时用）"},
         {"sep": True},
         {"id": "quit", "label": "完全关闭后台监控"},
@@ -209,6 +292,9 @@ def tray_action(name):
     elif name == "folder":
         say("托盘菜单：打开程序文件夹")
         open_program_folder()
+    elif name == "selfcheck":
+        say("托盘菜单：体检并自动修复")
+        threading.Thread(target=_run_selfcheck_bg, daemon=True).start()
     elif name == "quit":
         say("托盘菜单：完全关闭后台监控")
         # 先关开关再发退出请求：这样即使计划任务把它重启，它一启动就自己退出
@@ -299,6 +385,15 @@ def main():
         return 0
 
     started = dt.datetime.now()
+
+    # ★ 先把可能残留的「退出请求」吃掉再开始。
+    #   「退出」是**一条消息**，不是一个永久状态：上一次会话留下的旧留言
+    #   不该影响这次刚起来的我们。实测踩到过 ——
+    #   先 request_exit() 停掉旧哨兵（旧的可能已经死了，没人消费这条留言），
+    #   再启动新的：新的启动瞬间读到那条旧留言，立刻自杀，表现为「刚启动就退出」。
+    if take_exit_request():
+        say("启动时清掉了一条上次没消费掉的旧「退出请求」（不影响本次运行）")
+
     say(f"哨兵启动（进程 {os.getpid()}）")
 
     cond = source.Conditional()     # 记住「上次拿到的版本标记」，用来问「变了没有」
@@ -311,10 +406,12 @@ def main():
         # 纯白线条会看不见。
         tray_style = ((cfg.get("tray_style") or "").strip()
                       or tray_mod.load_styles()[0])
+        global TRAY
         tray = tray_mod.Tray(tray_mod.icon_path(tray_style),
                              menu_provider=tray_menu,
                              on_default=open_settings, on_action=tray_action,
                              tip="win升级报告 · 正在启动")
+        TRAY = tray
         if tray.start():
             say("托盘图标已挂上（看不到的话可能在任务栏的「隐藏的图标」里）")
             if not cfg.get("tray_hint_shown"):

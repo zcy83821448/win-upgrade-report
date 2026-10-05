@@ -19,6 +19,7 @@ import notify                                                               # no
 import reporter                                                             # noqa: E402
 import deepseek_api                                                         # noqa: E402
 import tray as tray_mod                                                     # noqa: E402
+import selfcheck                                                            # noqa: E402
 
 WATCH_TASK_NAME = "WinUpdReport_Watch"
 DAILY_TASK_NAME = "WinUpdReport_Daily"     # 旧版每日任务；装哨兵时顺手卸掉
@@ -322,6 +323,9 @@ class App:
         btns = ttk.Frame(root, padding=(12, 4, 12, 12))
         btns.pack(fill="x")
         ttk.Button(btns, text="保存设置", command=self.save).pack(side="left")
+        self.btn_selfcheck = ttk.Button(btns, text="体检并自动修复",
+                                        command=self.run_selfcheck)
+        self.btn_selfcheck.pack(side="left", padx=6)
         self.btn_check = ttk.Button(btns, text="立刻检测一遍（过程显示在日志里）",
                                     command=lambda: self.run_check_live())
         self.btn_check.pack(side="left", padx=6)
@@ -402,10 +406,7 @@ class App:
     def stop_watch(self):
         """停掉后台哨兵（但不关窗口）。"""
         self.cfg["watch_enabled"] = False      # 内存里也同步，免得之后保存设置写回旧值
-        if load_watch().get("online"):
-            # 先关开关再发退出请求：即使计划任务把它重启，它一启动就自己退了
-            patch_config(watch_enabled=False)
-            request_exit()
+        selfcheck.stop_sentinel()
 
     def _fit_window(self):
         """按内容的实际需要定窗口大小，保证每个标签页都完整显示。
@@ -1353,25 +1354,43 @@ class App:
     def start_watch(self):
         """把后台监控跑起来（顶部那个开关也走这里）。"""
         self.cfg["watch_enabled"] = True
-        patch_config(watch_enabled=True)
-        if load_watch().get("online"):
+        was = selfcheck.online()
+        ok, msg = selfcheck.start_sentinel()
+        if not ok:
+            self.set_status(msg, "#c00")
+            return
+        if was:
             self.set_status("后台已经在跑了 —— 右下角那个托盘图标就是它。")
             self.refresh_status()
-            return
-        try:
-            # env：必须摘掉 _MEIPASS2，否则哨兵会住进界面的临时目录 ——
-            # 界面一退出就删不掉那个目录（弹 Failed to remove temporary directory），
-            # 而且万一删掉了，正在跑的哨兵会当场崩。
-            subprocess.Popen(watch_cmd(), cwd=BASE_DIR, creationflags=NO_WINDOW,
-                             env=child_env())
-        except Exception as e:
-            self.set_status(f"启动失败：{e}", "#c00")
             return
         self.set_status("已经启动，几秒后右下角会出现托盘图标。"
                         "（要是没看到，点任务栏那个 ∧ 展开一下，"
                         "或者在「设置 → 个性化 → 任务栏 → 其他系统托盘图标」里把它打开）")
         self.root.after(2500, self.refresh_status)
         self.root.after(2500, self.refresh_logon_hint)
+
+    # ---------------------------------------------------- 体检并自动修复
+    def run_selfcheck(self):
+        """一键体检：能自己修的自己修，修不了的用人话说清楚。
+
+        为什么要做成按钮而不是让用户看日志：前面踩过的坑
+        （Failed to start embedded python interpreter / Failed to remove
+        temporary directory）都不是用户能看懂、能自己处理的东西。
+        工具应该自己发现、自己修，然后告诉人「哪一项需要你看一眼」。
+        """
+        self.set_status("正在体检…（会顺手把能自己修的问题修掉，几秒钟）")
+        self.busy_run(selfcheck.check_all, self._selfcheck_done,
+                      msg="正在体检并自动修复…")
+
+    def _selfcheck_done(self, res, err):
+        if err or not res:
+            self.set_status(f"体检失败：{err or '没有结果'}", "#c00")
+            return
+        head = selfcheck.summary(res)
+        self.set_status("体检完成：" + head)
+        self.refresh_status()
+        messagebox.showinfo(APP_TITLE, "体检完成：" + head + "\n\n"
+                            + "\n".join(selfcheck.report_lines(res)))
 
     def run_silent(self, args=None):
         """手动跑一次检测。
