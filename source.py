@@ -37,34 +37,55 @@ def configure(cfg):
     SETTINGS["retries"] = max(0, int(cfg.get("retries") if cfg.get("retries") is not None else 2))
 
 
+def settings_snapshot():
+    """给并发探测用的设置快照：多条线同时抓时，每条都拿自己的一份，
+    免得跑到一半 configure() 改了全局设置（历史上 configure 确实被调过两次）。"""
+    return dict(SETTINGS)
+
+
 class FetchError(Exception):
     pass
 
 
-def _opener():
-    handlers = []
-    if SETTINGS["proxy"]:
-        handlers.append(urllib.request.ProxyHandler({
-            "http": SETTINGS["proxy"], "https": SETTINGS["proxy"]}))
-    handlers.append(urllib.request.HTTPSHandler(context=SSL_CTX))
-    return urllib.request.build_opener(*handlers)
+# opener 按代理设置缓存：同一份设置下反复请求时不必重建 handler 链。
+# 上游每个频道都要抓一次页面，重试还会再来一遍，这里省的是关键路径上的纯浪费。
+_OPENERS = {}
 
 
-def http_get(url, timeout=None, headers=None, retries=None):
-    timeout = timeout or SETTINGS["timeout"]
-    retries = SETTINGS["retries"] if retries is None else retries
+def _opener(proxy=None):
+    key = SETTINGS["proxy"] if proxy is None else proxy
+    op = _OPENERS.get(key)
+    if op is None:
+        handlers = []
+        if key:
+            handlers.append(urllib.request.ProxyHandler({"http": key, "https": key}))
+        handlers.append(urllib.request.HTTPSHandler(context=SSL_CTX))
+        op = urllib.request.build_opener(*handlers)
+        _OPENERS[key] = op
+    return op
+
+
+def _decode(raw):
+    for enc in ("utf-8", "gbk", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def http_get(url, timeout=None, headers=None, retries=None, settings=None):
+    st = settings or SETTINGS
+    timeout = timeout or st["timeout"]
+    retries = st["retries"] if retries is None else retries
+    opener = _opener(st.get("proxy") or "")
     last = None
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, headers=headers or HEADERS)
         try:
-            with _opener().open(req, timeout=timeout) as r:
+            with opener.open(req, timeout=timeout) as r:
                 raw = r.read()
-            for enc in ("utf-8", "gbk", "latin-1"):
-                try:
-                    return raw.decode(enc)
-                except UnicodeDecodeError:
-                    continue
-            return raw.decode("utf-8", "replace")
+            return _decode(raw)
         except urllib.error.HTTPError as e:
             last = e
             if e.code in (403, 429, 500, 502, 503, 504) and attempt < retries:
@@ -80,15 +101,102 @@ def http_get(url, timeout=None, headers=None, retries=None):
     raise FetchError(f"{type(last).__name__}: {last}") from last
 
 
+# ------------------------------------------------- 「变了没有」的条件请求
+
+class Conditional:
+    """记住每个网址上次的 ETag / Last-Modified，下次带上它去问「变了没有」。
+
+    为什么需要它：哨兵每 5 分钟看一次官方看板，如果每次都把整页拉下来
+    （约 113 KB），一天就是 30 多 MB，纯浪费。带上上次的标记去问，没变化时
+    微软服务器直接回 304，**传输 0 字节**，连 HTML 都不用解析。
+    这是实测确认过的（Flight Hub 支持 ETag 和 Last-Modified）。
+
+    用法：
+        cond = Conditional()
+        status, text = cond.get(url)
+        if status == 304:      # 没变化，什么都不用做
+            ...
+        else:                  # 有新内容，text 就是整页
+            ...
+    """
+
+    def __init__(self):
+        self._marks = {}          # url -> {"etag":..., "lastmod":...}
+        self.hits = 0             # 回 304（没变化）的次数
+        self.misses = 0           # 真的拉了全文的次数
+
+    def forget(self):
+        """丢掉所有标记：下次一定拿全文（例如怀疑自己漏掉了变化）。"""
+        self._marks.clear()
+
+    def get(self, url, timeout=None, settings=None):
+        st = settings or SETTINGS
+        timeout = timeout or st["timeout"]
+        retries = st["retries"]
+        opener = _opener(st.get("proxy") or "")
+        mark = self._marks.get(url) or {}
+        headers = dict(HEADERS)
+        if mark.get("etag"):
+            headers["If-None-Match"] = mark["etag"]
+        if mark.get("lastmod"):
+            headers["If-Modified-Since"] = mark["lastmod"]
+
+        last = None
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with opener.open(req, timeout=timeout) as r:
+                    raw = r.read()
+                    # 响应头要在 with 里面读，出了这个块对象就关了
+                    self._marks[url] = {"etag": r.headers.get("ETag") or "",
+                                        "lastmod": r.headers.get("Last-Modified") or ""}
+                self.misses += 1
+                return 200, _decode(raw)
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
+                    self.hits += 1
+                    return 304, None          # 没变化：正文压根没下载
+                last = e
+                if e.code in (403, 429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+            except Exception as e:
+                last = e
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+        raise FetchError(f"{type(last).__name__}: {last}") from last
+
+
 # ------------------------------------------------------------- Flight Hub
 
-def flighthub(timeout=None):
+def flighthub(timeout=None, settings=None):
     """抓 Flight Hub 并解析出所有 Insider 频道的最新构建。"""
-    page = http_get(ch_mod.FLIGHTHUB_URL, timeout=timeout)
+    page = http_get(ch_mod.FLIGHTHUB_URL, timeout=timeout, settings=settings)
     data = ch_mod.parse_flighthub(page)
     if not data:
         raise FetchError("Flight Hub 页面没解析出任何频道，页面结构可能变了")
     return data
+
+
+def flighthub_conditional(cond, timeout=None, settings=None):
+    """哨兵用的版本：先问「变了没有」，真的变了才解析。
+
+    返回 (状态码, 数据)：
+        (304, None)  —— 一点都没变，什么都没下载，直接跳过
+        (200, {...}) —— 有新内容，data 是解析好的各条线最新构建
+    """
+    status, page = cond.get(ch_mod.FLIGHTHUB_URL, timeout=timeout, settings=settings)
+    if status == 304:
+        return 304, None
+    data = ch_mod.parse_flighthub(page)
+    if not data:
+        # 页面结构变了的话，标记要丢掉，否则会一直卡在「看起来变了但解析不出来」
+        cond.forget()
+        raise FetchError("Flight Hub 页面没解析出任何频道，页面结构可能变了")
+    return 200, data
 
 
 # --------------------------------------------------------------- uupdump
@@ -114,11 +222,11 @@ def parse_uupdump(page_html):
     return rows
 
 
-def uupdump_latest(url_or_category, arch="amd64", timeout=None):
+def uupdump_latest(url_or_category, arch="amd64", timeout=None, settings=None):
     url = url_or_category
     if not url.startswith("http"):
         url = "https://uupdump.net/known.php?q=category:" + url_or_category
-    rows = parse_uupdump(http_get(url, timeout=timeout))
+    rows = parse_uupdump(http_get(url, timeout=timeout, settings=settings))
     if not rows:
         raise FetchError("uupdump 页面里没解析到任何版本，页面结构可能变了")
     # 先按构建号归并，取构建号最新的那一组；组内再按偏好挑架构

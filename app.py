@@ -2,7 +2,11 @@
 """程序入口：打包成 exe 之后由它按参数分流。
 
     win升级报告.exe                    打开设置界面（默认）
-    win升级报告.exe --check [参数]     跑一次检测（计划任务用这个）
+    win升级报告.exe --watch            常驻哨兵：一直开着，每隔几分钟问一次官方看板
+                                       （计划任务 / 登录自启用这个；没窗口）
+    win升级报告.exe --watch --once     只跑一轮就退出（排查用）
+    win升级报告.exe --watch --status   看哨兵现在活着没有
+    win升级报告.exe --check [参数]     手动跑一次检测
     win升级报告.exe --view <参数>      报告查看器（通知点击用这个）
     win升级报告.exe --list-channels    列出更新线
     win升级报告.exe --selftest         自检：环境、配置、数据目录、依赖
@@ -68,7 +72,25 @@ def _selftest():
     key = config.resolve_api_key(cfg)
     out("  API Key     :", ("已填 " + config.mask_key(key)) if key else "没填！")
     out("  模型        :", cfg.get("model"))
-    out("  检测时间    :", f"每 {cfg.get('interval_days')} 天 {cfg.get('check_time')}")
+    out("  检测节奏    :",
+        f"哨兵每 {cfg.get('watch_interval_minutes')} 分钟看一次官方看板"
+        + ("（已开启）" if cfg.get("watch_enabled", True) else "（已关闭）")
+        + ("；玩游戏时彻底静默" if cfg.get("game_mode_enabled", True) else ""))
+    try:
+        w = config.load_watch()
+        out("  哨兵进程    :",
+            (f"运行中，进程 {w.get('pid')}，上次问官方 {w.get('last_check') or '还没问过'}")
+            if w.get("online") else "没有在运行（计划任务装了吗？）")
+    except Exception as e:
+        out("  哨兵进程    : 查询失败 ->", e)
+    try:
+        import gamesense
+        r = gamesense.check(ignore=cfg.get("game_ignore") or [])
+        out("  游戏判定    :",
+            ("现在判定为「在玩」：" + (r["exe"] or "全屏应用")) if r["gaming"]
+            else "现在判定为「没在玩」")
+    except Exception as e:
+        out("  游戏判定    : 失败 ->", e)
     try:
         import tkinter  # noqa: F401
         out("  tkinter     : OK")
@@ -108,22 +130,27 @@ def _selftest():
 
 def _task_mode(rest):
     """命令行装/卸/查计划任务：
-        win升级报告.exe --task query
-        win升级报告.exe --task install [HH:MM] [间隔天数]     （会弹 UAC）
-        win升级报告.exe --task remove                        （会弹 UAC）
+        win升级报告.exe --task query      查状态
+        win升级报告.exe --task install    装哨兵任务（会弹 UAC，顺手卸掉旧的每日任务）
+        win升级报告.exe --task remove     删任务（会弹 UAC）
     """
     import config
     import gui
     sub = (rest[0].lower() if rest else "query")
-    cfg = config.load_config()
     if sub == "query":
         out(gui.task_info())
-        out("运行目标:", " ".join(str(x) for x in gui.task_target()))
-    elif sub in ("install", "remove"):
-        t = rest[1] if len(rest) > 1 else cfg.get("check_time") or "12:00"
-        d = int(rest[2]) if len(rest) > 2 else int(cfg.get("interval_days") or 1)
-        ok, msg = gui.ps_task_elevated(sub, t, d)
-        out(("成功" if ok else "失败") + ":", msg or ("已安装，每 %d 天 %s" % (d, t)))
+        out("哨兵运行目标:", " ".join(str(x) for x in gui.watch_target()))
+        out("（--task install 装的就是它：登录时启动、每几分钟看一次官方看板）")
+    elif sub in ("install", "daily", "install-daily", "remove"):
+        mode = "daily" if "daily" in sub else "watch"
+        verb = "remove" if sub == "remove" else "install"
+        ok, msg = gui.ps_task_elevated(verb, mode=mode,
+                                       also_remove=gui.DAILY_TASK_NAME)
+        cfg = config.load_config()
+        want = ("已删除哨兵任务和旧的每日任务" if verb == "remove" else
+                f"已装哨兵任务：登录时启动，每 "
+                f"{cfg.get('watch_interval_minutes') or 5} 分钟看一次，不限时、崩了自动重启")
+        out(("成功" if ok else "失败") + ":", msg or want)
     else:
         out("未知子命令:", sub, "（用 query / install / remove）")
     path = _flush(os.path.join(config.LOG_DIR, "task_cli.txt"))
@@ -159,6 +186,11 @@ def main():
         sys.argv = [argv0] + rest
         import checker
         return checker.main()
+    if mode in ("--watch", "watch"):
+        # 常驻哨兵。计划任务和「登录自启」快捷方式都指向这个模式。
+        sys.argv = [argv0] + rest
+        import watch
+        return watch.main()
     if mode in ("--task", "task"):
         return _task_mode(rest)
     if mode in ("--view", "view"):

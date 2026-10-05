@@ -1,4 +1,4 @@
-﻿# 弹出一条 Windows 通知，点击正文 / 按钮都走自定义协议，交给 viewer.py 处理
+# 弹出一条 Windows 通知，点击正文 / 按钮都走自定义协议，交给 viewer.py 处理
 param(
     [Parameter(Mandatory=$true)][string]$AppId,
     [Parameter(Mandatory=$true)][string]$Title,
@@ -21,8 +21,8 @@ function Esc([string]$s) { return [System.Security.SecurityElement]::Escape($s) 
 function Uri([string]$s) { return [System.Uri]::EscapeDataString($s) }
 
 $actions = ""
-if ($Button1) { $actions += "<action content=`"$(Esc $Button1)`" activationType=`"protocol`" arguments=`"$Protocol`:$Arg1`" />" }
-if ($Button2) { $actions += "<action content=`"$(Esc $Button2)`" activationType=`"protocol`" arguments=`"$Protocol`:$Arg2`" />" }
+if ($Button1) { $actions += "<action content=`"$(Esc $Button1)`" activationType=`"protocol`" arguments=`"$(Esc "$Protocol`:$Arg1")`" />" }
+if ($Button2) { $actions += "<action content=`"$(Esc $Button2)`" activationType=`"protocol`" arguments=`"$(Esc "$Protocol`:$Arg2")`" />" }
 $actionsXml = ""
 if ($actions -ne "") { $actionsXml = "<actions>$actions</actions>" }
 

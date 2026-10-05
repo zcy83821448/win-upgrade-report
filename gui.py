@@ -12,17 +12,21 @@ from tkinter import ttk, messagebox
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (load_config, save_config, load_state, channel_state,   # noqa: E402
                     resolve_api_key, mask_key, BASE_DIR, REPORT_DIR, LOG_DIR,
-                    resource_path, is_frozen, app_exe)
+                    resource_path, is_frozen, app_exe,
+                    load_watch, request_check_now)
 import channels as ch_mod                                                   # noqa: E402
 import notify                                                               # noqa: E402
 import reporter                                                             # noqa: E402
 import deepseek_api                                                         # noqa: E402
 
-TASK_NAME = "WinUpdReport_Daily"
+WATCH_TASK_NAME = "WinUpdReport_Watch"
+DAILY_TASK_NAME = "WinUpdReport_Daily"     # 旧版每日任务；装哨兵时顺手卸掉
+TASK_NAME = WATCH_TASK_NAME                # 界面上显示和操作的主任务
 PS = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                   "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
 TASK_PS1 = resource_path("task.ps1")
 CHECKER = os.path.join(BASE_DIR, "checker.py")
+WATCH = os.path.join(BASE_DIR, "watch.py")
 LOG_PATH = os.path.join(LOG_DIR, "checker.log")
 NO_WINDOW = 0x08000000
 NEW_CONSOLE = 0x00000010
@@ -74,10 +78,17 @@ def ps_run(args, timeout=90):
 
 # ------------------------------------------------------- 计划任务（需提权）
 def task_target():
-    """计划任务要运行什么：打包后是 exe --check，源码时是 pythonw checker.py。"""
+    """每日任务要运行什么（旧版，现在基本不用了）。"""
     if FROZEN:
         return sys.executable, "--check"
     return pythonw(), f'"{CHECKER}"'
+
+
+def watch_target():
+    """哨兵要运行什么：打包后是 exe --watch，源码时是 pythonw watch.py。"""
+    if FROZEN:
+        return sys.executable, "--watch"
+    return pythonw(), f'"{WATCH}"'
 
 
 def local_task_ps1():
@@ -98,12 +109,19 @@ def local_task_ps1():
         return TASK_PS1
 
 
-def ps_task(action, time="12:00", days=1):
+def ps_task(action, mode="watch", time="12:00", days=1, at_logon=False,
+            also_remove=""):
     ps1 = local_task_ps1()
-    exe, args = task_target()
-    return ps_run(["-File", ps1, "-Action", action, "-TaskName", TASK_NAME,
-                   "-Time", time, "-DaysInterval", str(days),
-                   "-Exe", exe, "-Arguments", args, "-WorkDir", BASE_DIR])
+    if mode == "daily":
+        exe, args, name = *task_target(), DAILY_TASK_NAME
+    else:
+        exe, args, name = *watch_target(), WATCH_TASK_NAME
+    extra = ["-AtLogon:$true"] if at_logon else []
+    if also_remove:
+        extra += ["-AlsoRemove", also_remove]
+    return ps_run(["-File", ps1, "-Action", action, "-Mode", mode,
+                   "-TaskName", name, "-Time", time, "-DaysInterval", str(days),
+                   "-Exe", exe, "-Arguments", args, "-WorkDir", BASE_DIR] + extra)
 
 
 def is_elevated():
@@ -114,10 +132,17 @@ def is_elevated():
         return False
 
 
-def ps_task_elevated(action, time="12:00", days=1, timeout=300):
+def ps_task_elevated(action, mode="watch", time="12:00", days=1, timeout=300,
+                     at_logon=False, also_remove=""):
     import tempfile
     ps1 = local_task_ps1()
-    exe, targs = task_target()
+    if mode == "daily":
+        exe, targs, name = *task_target(), DAILY_TASK_NAME
+    else:
+        exe, targs, name = *watch_target(), WATCH_TASK_NAME
+    extra = " -AtLogon:$true" if at_logon else ""
+    if also_remove:
+        extra += f" -AlsoRemove '{also_remove}'"
     out_log = os.path.join(tempfile.gettempdir(), "winupd_task_out.txt")
     inner = os.path.join(tempfile.gettempdir(), "winupd_task_inner.ps1")
     body = [
@@ -125,9 +150,9 @@ def ps_task_elevated(action, time="12:00", days=1, timeout=300):
         f"$log = '{out_log}'",
         "Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue",
         "try {",
-        f"  & '{ps1}' -Action '{action}' -TaskName '{TASK_NAME}' "
+        f"  & '{ps1}' -Action '{action}' -Mode '{mode}' -TaskName '{name}' "
         f"-Time '{time}' -DaysInterval {int(days)} "
-        f"-Exe '{exe}' -Arguments '{targs}' -WorkDir '{BASE_DIR}' *>&1 | "
+        f"-Exe '{exe}' -Arguments '{targs}' -WorkDir '{BASE_DIR}'{extra} *>&1 | "
         "ForEach-Object { $_.ToString() } | Add-Content -LiteralPath $log -Encoding UTF8",
         "  'RC=0' | Add-Content -LiteralPath $log -Encoding UTF8",
         "} catch {",
@@ -153,11 +178,38 @@ def ps_task_elevated(action, time="12:00", days=1, timeout=300):
 
 
 def task_info():
+    """返回一段人能看懂的计划任务状态（哨兵任务 + 可能还留着的旧每日任务）。"""
     r = ps_task("query")
-    out = (r.stdout or "").strip()
-    if not out or out == "NONE":
+    raw = (r.stdout or "").strip()
+    if not raw:
         return "未安装计划任务"
-    return out.replace(";", "  |  ")
+    lines = []
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if ":" not in ln:
+            continue
+        name, rest = ln.split(":", 1)
+        name, rest = name.strip(), rest.strip()
+        is_watch = (name == WATCH_TASK_NAME)
+        if rest == "NONE":
+            if is_watch:
+                lines.append("哨兵任务：未安装　→ 点下面「安装 / 更新计划任务」")
+            continue
+        m = re.search(r"STATE=(\S+);\s*NEXT=([^;]*);\s*LAST=([^;]*);"
+                      r"\s*TRIGGERS=([^;]*)(?:;\s*LIMIT=(.*))?", rest)
+        if not m:
+            lines.append(f"{name}：{rest}")
+            continue
+        state, nxt, last, trig, limit = (x.strip() if x else ""
+                                         for x in m.groups())
+        label = "哨兵任务" if is_watch else f"旧任务（{name}）"
+        warn = ""
+        if is_watch and limit and limit not in ("PT0S", "P0D"):
+            # 限时若不是「不限时」，常驻程序会被系统定时杀掉，表现为「过一会儿就没动静」
+            warn = f"　⚠ 限时={limit}（应当是不限时，请重新安装一次）"
+        lines.append(f"{label}：{state}　下次 {nxt or '-'}　上次 {last or '-'}　"
+                     f"触发器 {trig or '-'}{warn}")
+    return "\n".join(lines) or "未安装计划任务"
 
 
 def startup_link():
@@ -168,14 +220,15 @@ def startup_link():
 def install_startup():
     ps1 = os.path.join(LOG_DIR, "_mklnk.ps1")
     link = startup_link()
-    exe, targs = task_target()
+    # 免管理员的备用方案：登录时启动哨兵（和计划任务干的是同一件事）
+    exe, targs = watch_target()
     body = ("$ws = New-Object -ComObject WScript.Shell\n"
             f"$s = $ws.CreateShortcut('{link}')\n"
             f"$s.TargetPath = '{exe}'\n"
             f"$s.Arguments = '{targs}'\n"
             f"$s.WorkingDirectory = '{BASE_DIR}'\n"
             "$s.WindowStyle = 7\n"
-            "$s.Description = 'win升级报告：登录时静默检查新版本'\n"
+            "$s.Description = 'win升级报告：登录时启动哨兵（常驻检测）'\n"
             "$s.Save()\n")
     with open(ps1, "w", encoding="utf-8-sig") as f:
         f.write(body)
@@ -576,6 +629,8 @@ class App:
         cmd = check_cmd(args, console=False)
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         self._live_lines = []
+        if load_watch().get("online"):
+            note += "；注意哨兵正在运行"
 
         def pump():
             proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
@@ -657,34 +712,110 @@ class App:
 
     def _check(self, p, row, label, key, hint=""):
         var = tk.BooleanVar(value=bool(self.cfg.get(key, True)))
-        ttk.Checkbutton(p, text=label, variable=var).grid(row=row, column=0, columnspan=2,
-                                                          sticky="w", pady=2)
+        cb = ttk.Checkbutton(p, text=label, variable=var)
+        cb.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
         self.v[key] = var
         if hint:
             ttk.Label(p, text=hint, foreground="#888").grid(row=row, column=2, sticky="w")
+        return cb
 
     def _build_detect(self, p):
-        self._entry(p, 0, "每天检测时间", "check_time", 8, "24 小时制，例如 12:00")
-        self._entry(p, 1, "每隔几天检测", "interval_days", 6, "1 = 每天都看")
-        self._check(p, 2, "同一天只运行一次（跑过就静默退出）", "run_once_per_day")
-        self._entry(p, 3, "静默时段", "quiet_hours", 16,
-                    "例如 23:00-07:00：这期间先攒着不出声，出了时段再补一条通知；留空则不限")
-        ttk.Separator(p, orient="horizontal").grid(row=4, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        self._check(p, 5, "发现新版本时发 Windows 通知", "notify")
-        self._check(p, 6, "多条线同时更新时合并成一条通知", "merge_notifications")
-        self._entry(p, 7, "连续失败几次后通知我", "notify_on_error_after", 6, "0 = 出错也不通知")
+        # ---------- 哨兵：每隔几分钟问一次官方看板 ----------
+        self._check(p, 0, "开启即时提醒（哨兵常驻：登录后一直开着）", "watch_enabled")
+        self._entry(p, 1, "每隔几分钟看一次", "watch_interval_minutes", 6,
+                    "只问「官网变了没有」；没变化时传输 0 字节，也不调 AI")
+        ttk.Label(p, text="官方看板一变，就抓发布说明 → 让 AI 写成中文报告 → 弹一条通知。\n"
+                          "从「官网发布」到「你收到通知」通常 2～5 分钟"
+                          "（其中 AI 总结约占 30～90 秒）。\n"
+                          "没新版本时不发任何通知，日志也不刷。",
+                  foreground="#888", justify="left").grid(row=2, column=1, columnspan=2,
+                                                          sticky="w", pady=(0, 8))
+
+        # ---------- 玩游戏时彻底静默 ----------
+        self._check(p, 3, "玩游戏时彻底静默（不联网、不调 AI、不通知、不写盘）",
+                    "game_mode_enabled")
+        self._entry(p, 4, "游戏关闭后确认几秒才恢复", "game_exit_hold_seconds", 6,
+                    "防止切进切出时通知乱弹；恢复后会立刻补查一次")
+        ttk.Label(p, text="判定方式：有窗口铺满整块屏幕 + 没有标题栏 + 不是系统组件/叠加层。\n"
+                          "（无边框全屏的游戏正好符合这个形状。）",
+                  foreground="#888", justify="left").grid(row=5, column=1, columnspan=2,
+                                                          sticky="w", pady=(0, 4))
+        self.btn_quiet = ttk.Button(p, text="现在静默 2 小时（手动）",
+                                    command=self.quiet_now)
+        self.btn_quiet.grid(row=6, column=1, sticky="w", pady=(0, 2))
+        self.btn_ignore = ttk.Button(p, text="把当前前台程序加进忽略名单",
+                                     command=self.ignore_foreground)
+        self.btn_ignore.grid(row=6, column=2, sticky="w", padx=6, pady=(0, 2))
+        self.quiet_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
+        self.quiet_lbl.grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 6))
+
         ttk.Separator(p, orient="horizontal").grid(row=8, column=0, columnspan=3,
                                                    sticky="ew", pady=8)
-        ttk.Label(p, text="报告详细程度").grid(row=9, column=0, sticky="w", pady=3)
+        # ---------- 通知 ----------
+        self._check(p, 9, "发现新版本时发 Windows 通知", "notify")
+        self._check(p, 10, "多条线同时更新时合并成一条通知", "merge_notifications")
+        self._entry(p, 11, "连续失败几次后通知我", "notify_on_error_after", 6,
+                    "0 = 出错也不通知")
+        self._entry(p, 12, "静默时段", "quiet_hours", 16,
+                    "例如 23:00-07:00：这期间先攒着不出声，出了时段再补发；留空则不限")
+        ttk.Separator(p, orient="horizontal").grid(row=13, column=0, columnspan=3,
+                                                   sticky="ew", pady=8)
+        ttk.Label(p, text="报告详细程度").grid(row=14, column=0, sticky="w", pady=3)
         self.detail_var = tk.StringVar(value=self.cfg.get("detail") or "标准")
         ttk.Combobox(p, textvariable=self.detail_var, state="readonly", width=8,
                      values=list(deepseek_api.DETAIL_SPEC.keys())
-                     ).grid(row=9, column=1, sticky="w", padx=6)
-        self._check(p, 10, "报告末尾附上官方原文全文", "include_official_text")
-        self._entry(p, 11, "每个频道最多保留报告数", "keep_reports", 8)
-        self._check(p, 12, "自动收录 Flight Hub 上新出现的更新线（默认不启用）",
+                     ).grid(row=14, column=1, sticky="w", padx=6)
+        self._check(p, 15, "报告末尾附上官方原文全文", "include_official_text")
+        self._entry(p, 16, "每个频道最多保留报告数", "keep_reports", 8)
+        self._check(p, 17, "自动收录 Flight Hub 上新出现的更新线（默认不启用）",
                     "auto_discover_channels")
+
+    def quiet_now(self):
+        """手动静默：游戏识别不出来时兜底用（点一下 = 静默 2 小时，再点 = 取消）。"""
+        if not self.save(quiet=True):
+            return
+        cur = (self.cfg.get("silent_until") or "").strip()
+        active = False
+        if cur:
+            try:
+                active = dt.datetime.fromisoformat(cur) > dt.datetime.now()
+            except Exception:
+                active = False
+        if active:
+            self.cfg["silent_until"] = ""
+            save_config(self.cfg)
+            self.set_status("已取消手动静默，哨兵马上恢复检测。")
+        else:
+            until = dt.datetime.now() + dt.timedelta(hours=2)
+            self.cfg["silent_until"] = until.isoformat(timespec="seconds")
+            save_config(self.cfg)
+            self.set_status(f"已静默到 {until:%H:%M}（哨兵最多 5 秒后生效），"
+                            f"到点自动恢复正常。")
+        self.refresh_status()
+
+    def ignore_foreground(self):
+        """误判兜底：把某个程序加进忽略名单，以后不再因为它进静默。"""
+        try:
+            import gamesense
+            exe = gamesense.current_foreground()
+        except Exception as e:
+            self.set_status(f"取不到当前前台程序：{e}", "#c00")
+            return
+        if not exe:
+            self.set_status("取不到当前前台程序", "#c00")
+            return
+        name = os.path.basename(exe)
+        if not self.save(quiet=True):
+            return
+        lst = list(self.cfg.get("game_ignore") or [])
+        if name.lower() in [str(x).lower() for x in lst]:
+            self.set_status(f"{name} 已经在忽略名单里了")
+            return
+        lst.append(name)
+        self.cfg["game_ignore"] = lst
+        save_config(self.cfg)
+        self.set_status(f"已把 {name} 加进忽略名单，以后不会因为它进静默模式。")
+        self.refresh_status()
 
     # ======================================================== API
     def _build_api(self, p):
@@ -701,10 +832,12 @@ class App:
         self._entry(p, 5, "temperature", "temperature", 8)
         self._entry(p, 6, "请求超时（秒）", "request_timeout", 8)
         self._entry(p, 7, "网络重试次数", "retries", 6)
-        self._entry(p, 8, "代理（可选）", "proxy", 30, "例如 http://127.0.0.1:7897；留空直连")
-        self._entry(p, 9, "喂给模型的官网原文上限（字符）", "max_context_chars", 10)
+        self._entry(p, 8, "并发抓取线程数", "max_workers", 6,
+                    "同时抓几条更新线；1 = 串行。只有多条 uupdump 线时才有区别")
+        self._entry(p, 9, "代理（可选）", "proxy", 30, "例如 http://127.0.0.1:7897；留空直连")
+        self._entry(p, 10, "喂给模型的官网原文上限（字符）", "max_context_chars", 10)
         self.btn_apitest = ttk.Button(p, text="测试 Key 与模型", command=self.test_api)
-        self.btn_apitest.grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.btn_apitest.grid(row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     # ======================================================== 计划任务
     def _build_task(self, p):
@@ -720,30 +853,68 @@ class App:
         self.btn_task_remove.grid(row=2, column=1, sticky="w", padx=6)
         ttk.Label(p, text="（注册计划任务要管理员权限，会弹一次 UAC）",
                   foreground="#888").grid(row=2, column=2, sticky="w")
-        ttk.Button(p, text="立刻静默跑一次", command=lambda: self.run_silent(["--force"])
-                   ).grid(row=3, column=0, columnspan=2, sticky="w", pady=6)
+        ttk.Label(p, text=("这个任务干什么：登录时悄悄启动哨兵，一直开着；每几分钟问一次官方\n"
+                           "看板，只有真出了新版本才通知你。任务设成「不限时 + 崩了自动重启」，\n"
+                           "不会被系统定时杀掉。安装时会顺手把旧的每日任务卸掉（已不需要）。"),
+                  foreground="#333", justify="left").grid(row=3, column=0, columnspan=4,
+                                                          sticky="w", pady=(8, 2))
+        self.logon_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
+        self.logon_lbl.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Button(p, text="刷新哨兵状态", command=self.refresh_logon_hint
+                   ).grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Button(p, text="立刻静默跑一次（手动检测）",
+                   command=lambda: self.run_silent(["--force"])
+                   ).grid(row=5, column=1, columnspan=2, sticky="w")
         self.btn_startup = ttk.Button(p, text="装/卸 登录自启（免管理员备用）",
                                       command=self.toggle_startup)
-        self.btn_startup.grid(row=4, column=0, columnspan=2, sticky="w")
+        self.btn_startup.grid(row=6, column=0, columnspan=2, sticky="w")
         self.startup_lbl = ttk.Label(p, text="", foreground="#333")
-        self.startup_lbl.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Separator(p, orient="horizontal").grid(row=6, column=0, columnspan=4,
+        self.startup_lbl.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Separator(p, orient="horizontal").grid(row=8, column=0, columnspan=4,
                                                    sticky="ew", pady=10)
-        ttk.Label(p, text="程序目录").grid(row=7, column=0, sticky="w")
-        ttk.Label(p, text=BASE_DIR, foreground="#666").grid(row=7, column=1, columnspan=3,
+        ttk.Label(p, text="程序目录").grid(row=9, column=0, sticky="w")
+        ttk.Label(p, text=BASE_DIR, foreground="#666").grid(row=9, column=1, columnspan=3,
                                                             sticky="w")
-        ttk.Label(p, text="运行方式").grid(row=8, column=0, sticky="w")
-        _exe, _args = task_target()
+        ttk.Label(p, text="运行方式").grid(row=10, column=0, sticky="w")
+        _exe, _args = watch_target()
         ttk.Label(p, text=f"{_exe} {_args}", foreground="#666").grid(
-            row=8, column=1, columnspan=3, sticky="w")
-        ttk.Button(p, text="注册通知 / 协议", command=self.reg).grid(row=9, column=0,
+            row=10, column=1, columnspan=3, sticky="w")
+        ttk.Button(p, text="注册通知 / 协议", command=self.reg).grid(row=11, column=0,
                                                                     sticky="w", pady=8)
         ttk.Button(p, text="在桌面放快捷方式",
-                   command=lambda: self.make_shortcut("desktop")).grid(row=9, column=1,
+                   command=lambda: self.make_shortcut("desktop")).grid(row=11, column=1,
                                                                        sticky="w")
         ttk.Button(p, text="放进开始菜单",
-                   command=lambda: self.make_shortcut("startmenu")).grid(row=9, column=2,
+                   command=lambda: self.make_shortcut("startmenu")).grid(row=11, column=2,
                                                                          sticky="w")
+        self.refresh_logon_hint()
+
+    # ---- 哨兵状态
+    def refresh_logon_hint(self):
+        """在「计划任务」页显示哨兵现在是死是活。"""
+        try:
+            w = load_watch()
+            if w.get("online"):
+                mode = {"game": "游戏静默中", "paused": "已暂停（没启用）"}.get(
+                    w.get("mode"), "正常")
+                txt = (f"哨兵：运行中（进程 {w.get('pid')}）　状态：{mode}\n"
+                       f"上次问官方：{w.get('last_check') or '还没问过'}"
+                       f"　上次有新版本：{w.get('last_change') or '还没有过'}"
+                       f"　间隔：每 {w.get('interval_minutes')} 分钟"
+                       f"　累计检测 {w.get('checks')} 次")
+                if w.get("game_exe"):
+                    txt += f"\n因为检测到全屏程序而静默：{w.get('game_exe')}"
+                if w.get("manual_until"):
+                    txt += f"\n手动静默到：{w.get('manual_until')}"
+                if w.get("last_result"):
+                    txt += f"\n最近结果：{w.get('last_result')}"
+            else:
+                txt = ("哨兵：没有在运行。\n"
+                       "刚开机的话等几秒再点「刷新哨兵状态」；一直是这样就重新装一次计划任务，"
+                       "或改用下面的「登录自启」。")
+            self.logon_lbl.configure(text=txt)
+        except Exception:
+            pass
 
     # ======================================================== 日志
     def _build_log(self, p):
@@ -825,9 +996,10 @@ class App:
             val = var.get()
             if isinstance(var, tk.BooleanVar):
                 cfg[k] = bool(val)
-            elif k in ("max_tokens", "request_timeout", "retries",
+            elif k in ("max_tokens", "request_timeout", "retries", "max_workers",
                        "max_context_chars", "interval_days", "keep_reports",
-                       "notify_on_error_after"):
+                       "notify_on_error_after", "watch_interval_minutes",
+                       "game_exit_hold_seconds", "tick_seconds"):
                 try:
                     cfg[k] = int(str(val).strip() or 0)
                 except ValueError:
@@ -842,16 +1014,17 @@ class App:
             else:
                 cfg[k] = str(val).strip()
         cfg["detail"] = self.detail_var.get()
-        cfg["schema"] = 2
+        cfg["schema"] = 3
 
-        t = (cfg.get("check_time") or "").strip() or "12:00"
+        # 旧版的「每天检测时间」现在只留给手动 --check 用，界面上不再暴露。
+        # 这里顺手把格式收拾干净；万一存的是坏值就退回默认，不能因为它挡住保存。
+        t = (cfg.get("check_time") or "").strip()
         try:
             hh, mm = t.split(":")
             dt.time(int(hh), int(mm))
             cfg["check_time"] = f"{int(hh):02d}:{int(mm):02d}"
         except Exception:
-            messagebox.showerror(APP_TITLE, "检测时间格式应为 HH:MM，例如 12:00")
-            return None
+            cfg["check_time"] = "12:00"
         qh = (cfg.get("quiet_hours") or "").strip()
         if qh:
             try:
@@ -863,6 +1036,15 @@ class App:
                 messagebox.showerror(APP_TITLE, "静默时段格式应为 HH:MM-HH:MM，例如 23:00-07:00")
                 return None
         cfg["interval_days"] = max(1, int(cfg.get("interval_days") or 1))
+        cfg["max_workers"] = max(1, min(16, int(cfg.get("max_workers") or 4)))
+        # 哨兵的节奏：太小会给微软服务器添麻烦，太大又失去「马上知道」的意义
+        cfg["watch_interval_minutes"] = max(
+            1, min(1440, int(cfg.get("watch_interval_minutes") or 5)))
+        cfg["game_exit_hold_seconds"] = max(
+            0, min(3600, int(cfg.get("game_exit_hold_seconds") or 60)))
+        cfg["tick_seconds"] = max(2, min(60, int(cfg.get("tick_seconds") or 5)))
+        cfg["game_ignore"] = [str(x).strip() for x in (cfg.get("game_ignore") or [])
+                              if str(x).strip()]
 
         # 只保留：启用的线 + 本来就配置过的线
         was = {c["id"] for c in self.cfg.get("channels", [])}
@@ -883,9 +1065,11 @@ class App:
         self.reload_channels()
         if not quiet:
             n = sum(1 for c in self.rows if c["enabled"])
-            has_task = self._task_text.startswith("STATE") or "Ready" in self._task_text
+            has_task = ("哨兵任务" in (self._task_text or "")
+                        and "未安装" not in (self._task_text or ""))
             self.set_status(f"已保存：监控 {n} 条更新线。"
-                            + ("时间/间隔改过的话，记得在「计划任务」页重新安装一次。"
+                            + ("哨兵会马上重读设置，间隔、游戏静默这些改动立刻生效，"
+                               "不用重装计划任务。"
                                if has_task else
                                "还没装计划任务，去「计划任务」页装一个。"))
         self.refresh_status()
@@ -894,9 +1078,25 @@ class App:
     def set_status(self, text, color="#0a6cff"):
         self.status.configure(text=text, foreground=color)
 
-    def run_silent(self, args):
-        run_background(args)
-        self.set_status("已在后台静默跑了一次，完事看「状态与日志」页和通知。")
+    def run_silent(self, args=None):
+        """手动跑一次检测。
+
+        哨兵在跑的时候就留言让它自己去查 —— 这样 state.json 只有一个写入者，
+        不会两个进程抢着写、把对方的记录覆盖掉（那会导致重复通知）。
+        """
+        w = load_watch()
+        if w.get("online"):
+            request_check_now()
+            if w.get("mode") == "game":
+                self.set_status("哨兵正在游戏静默中，你的请求已经记下；"
+                                "游戏一关就立刻检测。")
+            else:
+                self.set_status("已通知哨兵立刻检测（最多 5 秒后开始），"
+                                "结果和通知都由它来出，看「状态与日志」页。")
+            return
+        run_background(args or ["--force"])
+        self.set_status("哨兵没在运行，已在后台单独跑了一次，"
+                        "完事看「状态与日志」页和通知。")
 
     def test_toast(self):
         notify.register_app(self.cfg.get("app_id") or "WinUpdReport.App")
@@ -938,9 +1138,10 @@ class App:
         if not self.save(quiet=True):
             return
         notify.register_app(self.cfg.get("app_id") or "WinUpdReport.App")
-        cfg = self.cfg
         self.busy_run(
-            lambda: ps_task_elevated("install", cfg["check_time"], cfg["interval_days"]),
+            # 装哨兵任务，同时把旧的每日任务卸掉（哨兵已经取代它了）
+            lambda: ps_task_elevated("install", mode="watch",
+                                     also_remove=DAILY_TASK_NAME),
             self._install_done,
             msg="正在申请管理员权限（弹出 UAC 请点「是」，界面会一直等到你点完）…",
             widgets=(self.btn_task_install, self.btn_task_remove))
@@ -951,17 +1152,22 @@ class App:
         else:
             ok, msg = res
             if ok:
-                self.set_status(f"计划任务已安装：每 {self.cfg['interval_days']} 天 "
-                                f"{self.cfg['check_time']} 静默运行（关机错过会自动补跑）")
+                self.set_status(
+                    f"哨兵任务已安装：登录时启动，每 "
+                    f"{self.cfg.get('watch_interval_minutes') or 5} 分钟看一次官方看板，"
+                    f"不限时、崩了会自动重启；旧的每日任务已卸掉。")
             elif "取消" in msg or "canceled" in msg.lower():
-                self.set_status("UAC 被取消。可改用「装/卸 登录自启」这个免管理员方案。", "#c00")
+                self.set_status("UAC 被取消。可以改用「装/卸 登录自启」这个免管理员方案。",
+                                "#c00")
             else:
                 self.set_status("安装失败：" + (msg or "未知原因")[:260], "#c00")
         self.refresh_status()
         self.refresh_task_info_async()
 
     def remove_task(self):
-        self.busy_run(lambda: ps_task_elevated("remove"), self._remove_done,
+        self.busy_run(lambda: ps_task_elevated("remove", mode="watch",
+                                               also_remove=DAILY_TASK_NAME),
+                      self._remove_done,
                       msg="正在申请管理员权限删除计划任务…",
                       widgets=(self.btn_task_install, self.btn_task_remove))
 
@@ -997,13 +1203,52 @@ class App:
             lines.append(f"　{'☑' if c['enabled'] else '☐'} {c['name']}："
                          f"{cs.get('last_version') or '未记录'}（检测 {cs.get('last_check_date') or '从未'}）")
         pend = len(st.get("pending_notify") or [])
-        sumtxt = ("上次运行：" + (st.get("last_run_date") or "从未")
+        logon_date = st.get("last_logon_date") or ""
+
+        # 哨兵现在怎么样（有没有在跑、是不是因为游戏静默了）
+        w = load_watch()
+        if w.get("online"):
+            mode = {"game": "游戏静默中", "paused": "已暂停（没启用）"}.get(
+                w.get("mode"), "正常")
+            watch_txt = (f"哨兵：运行中　状态：{mode}　"
+                         f"上次问官方：{w.get('last_check') or '还没问过'}　"
+                         f"每 {w.get('interval_minutes')} 分钟一次")
+        else:
+            watch_txt = ("哨兵：没有在运行　→ 到「计划任务」页装一次，"
+                         "或者看那边写的排查办法")
+
+        sumtxt = (watch_txt + "\n"
+                  + "上次运行：" + (st.get("last_run_date") or "从未")
+                  + (f"　开机补跑：{logon_date}" if logon_date else "")
                   + f"　待补发通知：{pend} 条　"
                   + ("最近错误：" + (st.get("last_error") or "无")[:160]
                      if st.get("last_error") else "最近错误：无")
                   + "\n各条线状态：\n" + "\n".join(lines))
         self.summary_lbl.configure(text=sumtxt)
+
+        # 手动静默 / 忽略名单
+        su = (self.cfg.get("silent_until") or "").strip()
+        active = False
+        if su:
+            try:
+                active = dt.datetime.fromisoformat(su) > dt.datetime.now()
+            except Exception:
+                active = False
+        ign = self.cfg.get("game_ignore") or []
+        try:
+            self.quiet_lbl.configure(
+                text=((f"手动静默到 {su[:16].replace('T', ' ')}" if active
+                       else "没有手动静默")
+                      + f"　忽略名单 {len(ign)} 个" + (f"（{'、'.join(ign[:4])}）"
+                                                      if ign else "")
+                      + "　误判时点「把当前前台程序加进忽略名单」"))
+            self.btn_quiet.configure(text="取消手动静默" if active
+                                     else "现在静默 2 小时（手动）")
+        except Exception:
+            pass
+
         self.task_lbl.configure(text=self._task_text)
+        self.refresh_logon_hint()
         try:
             self.startup_lbl.configure(
                 text="登录自启：" + ("已开启" if os.path.exists(startup_link()) else "未开启"))
