@@ -22,9 +22,12 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import json
 import os
 import threading
 import traceback
+
+from config import resource_path
 
 _u32 = ctypes.windll.user32
 _shell = ctypes.windll.shell32
@@ -143,9 +146,61 @@ _u32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), ctypes.c_void_p,
 _u32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 _u32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
 _u32.PostQuitMessage.argtypes = [ctypes.c_int]
+_u32.DestroyIcon.restype = wt.BOOL
+_u32.DestroyIcon.argtypes = [ctypes.c_void_p]
 _shell.Shell_NotifyIconW.restype = wt.BOOL
 _shell.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.c_void_p]
 _shell.Shell_NotifyIconGetRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+
+# --------------------------------------------------------------- 图标样式
+
+def load_styles():
+    """读 icons/styles.json（由 做图标.py 生成）。
+
+    返回 (默认样式 id, 样式列表)。文件不在或者读坏了，就退回「只有一种样式」，
+    保证托盘怎么都能显示出来。
+    """
+    try:
+        p = resource_path(os.path.join("icons", "styles.json"))
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        styles = [s for s in (d.get("styles") or []) if s.get("ico")]
+        if styles:
+            return (d.get("default") or styles[0]["id"]), styles
+    except Exception:
+        pass
+    return "default", [{"id": "default", "name": "默认",
+                        "ico": "tray.ico", "preview": ""}]
+
+
+def _style_file(style_id, key):
+    _d, styles = load_styles()
+    for s in styles:
+        if s.get("id") == style_id:
+            fn = s.get(key)
+            if fn:
+                p = resource_path(os.path.join("icons", fn))
+                if os.path.exists(p):
+                    return p
+    return ""
+
+
+def icon_path(style_id):
+    """取某个样式的 .ico 完整路径；找不到就逐级退回 tray.ico / icon.ico。"""
+    p = _style_file(style_id, "ico")
+    if p:
+        return p
+    for name in ("tray.ico", "icon.ico"):
+        q = resource_path(name)
+        if os.path.exists(q):
+            return q
+    return ""
+
+
+def preview_path(style_id):
+    """取某个样式的预览 PNG（设置界面里显示用，tkinter 读不了 ICO）。"""
+    return _style_file(style_id, "preview")
 
 
 class Tray:
@@ -175,6 +230,7 @@ class Tray:
         self._alive = False
         self._balloon_req = None
         self._balloon_shown = False
+        self._icon_from_file = False
         self._lock = threading.Lock()
         self._wndproc = _WNDPROC(self._on_message)   # 必须留住引用，否则被回收
 
@@ -193,6 +249,29 @@ class Tray:
             self._tip = (text or "")[:127]
         if self._hwnd:
             _u32.PostMessageW(self._hwnd, WM_TIP, 0, 0)
+
+    def set_icon(self, path):
+        """换一个图标文件，不用重启进程。
+
+        用户在设置界面里换样式后，哨兵下一轮就会调这里把托盘图标换掉。
+        """
+        if not self._hwnd or not path or not os.path.exists(path):
+            return False
+        h = _u32.LoadImageW(None, path, IMAGE_ICON, 0, 0,
+                            LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        if not h:
+            return False
+        old = self._hicon
+        self._hicon = h
+        _shell.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid(NIF_ICON)))
+        # 旧图标是我们自己从文件加载的，要销毁，免得一次换一个攒着不放
+        try:
+            if old and self._icon_from_file:
+                _u32.DestroyIcon(ctypes.c_void_p(old))
+        except Exception:
+            pass
+        self._icon_from_file = True
+        return True
 
     def balloon(self, title, text):
         """弹一个气泡提示（图标旁边那种）。"""
@@ -255,9 +334,11 @@ class Tray:
                 return
 
             self._hicon = None
+            self._icon_from_file = False
             if self.icon_path and os.path.exists(self.icon_path):
                 self._hicon = _u32.LoadImageW(None, self.icon_path, IMAGE_ICON,
                                               0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                self._icon_from_file = bool(self._hicon)
             if not self._hicon:
                 self._hicon = _u32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
 

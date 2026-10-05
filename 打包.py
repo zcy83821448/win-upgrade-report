@@ -23,7 +23,8 @@ EXE_NAME = "win升级报告"
 HIDDEN = ["gui", "checker", "viewer", "reporter", "source", "deepseek_api",
           "notify", "channels", "config", "mdlite", "app", "watch", "gamesense",
           "tray"]
-DATA = ["toast.ps1", "task.ps1", "icon.ico"]
+DATA = ["toast.ps1", "task.ps1", "icon.ico", "tray.ico"]
+DATA_DIRS = ["icons"]      # 托盘图标样式（9 套 .ico + 预览图 + styles.json）
 
 README_TXT = """win升级报告
 ============
@@ -67,6 +68,16 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 
 看不到图标？Windows 会把新出现的托盘图标默认塞进「隐藏的图标」（任务栏那个 ∧）里。
 一次性设置：设置 → 个性化 → 任务栏 → 其他系统托盘图标 → 把 win升级报告 打开。
+
+图标样式可以换
+--------------
+托盘图标有 9 套样式（线条粗细：细/标准/粗  ×  箭头占位：小/标准/大）。
+在设置界面「检测与通知」页最下面的「任务栏图标样式」下拉框里挑，
+选完立刻生效，不用重启哨兵。下面还会显示一张实际效果的预览图。
+
+为什么不是选「16px / 20px」：托盘槽位大小是系统定的（你这台是 16x16），
+选哪一档分辨率都不会让屏幕上的图标变大变小；真正改变观感的是「箭头占多大地方」，
+所以做成了「占位」这个维度。每套 .ico 里仍然装齐了 16/20/24/32/40/48/64/256 八档。
 
 两种关闭方式
 ------------
@@ -120,6 +131,11 @@ def main():
         if not os.path.exists(p):
             print("缺少资源文件:", p)
             return 2
+    for d in DATA_DIRS:
+        p = os.path.join(BASE, d)
+        if not os.path.isdir(p):
+            print("缺少资源目录:", p)
+            return 2
 
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
            "--onefile", "--noconsole",
@@ -133,6 +149,8 @@ def main():
         cmd += ["--hidden-import", n]
     for d in DATA:
         cmd += ["--add-data", f"{os.path.join(BASE, d)};."]
+    for d in DATA_DIRS:
+        cmd += ["--add-data", f"{os.path.join(BASE, d)};{d}"]
     cmd.append(os.path.join(BASE, "app.py"))
 
     rc = run(cmd, cwd=BASE)

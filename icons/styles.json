@@ -1,0 +1,113 @@
+{
+  "default": "std-std",
+  "styles": [
+    {
+      "id": "thin-sm",
+      "weight": "thin",
+      "weight_zh": "细",
+      "stroke": 0.078,
+      "fill": "sm",
+      "fill_zh": "小",
+      "fill_ratio": 0.52,
+      "name": "细 + 小",
+      "ico": "tray-thin-sm.ico",
+      "preview": "tray-thin-sm-preview.png"
+    },
+    {
+      "id": "thin-std",
+      "weight": "thin",
+      "weight_zh": "细",
+      "stroke": 0.078,
+      "fill": "std",
+      "fill_zh": "标准",
+      "fill_ratio": 0.64,
+      "name": "细 + 标准",
+      "ico": "tray-thin-std.ico",
+      "preview": "tray-thin-std-preview.png"
+    },
+    {
+      "id": "thin-lg",
+      "weight": "thin",
+      "weight_zh": "细",
+      "stroke": 0.078,
+      "fill": "lg",
+      "fill_zh": "大",
+      "fill_ratio": 0.8,
+      "name": "细 + 大",
+      "ico": "tray-thin-lg.ico",
+      "preview": "tray-thin-lg-preview.png"
+    },
+    {
+      "id": "std-sm",
+      "weight": "std",
+      "weight_zh": "标准",
+      "stroke": 0.1,
+      "fill": "sm",
+      "fill_zh": "小",
+      "fill_ratio": 0.52,
+      "name": "标准 + 小",
+      "ico": "tray-std-sm.ico",
+      "preview": "tray-std-sm-preview.png"
+    },
+    {
+      "id": "std-std",
+      "weight": "std",
+      "weight_zh": "标准",
+      "stroke": 0.1,
+      "fill": "std",
+      "fill_zh": "标准",
+      "fill_ratio": 0.64,
+      "name": "标准 + 标准",
+      "ico": "tray-std-std.ico",
+      "preview": "tray-std-std-preview.png"
+    },
+    {
+      "id": "std-lg",
+      "weight": "std",
+      "weight_zh": "标准",
+      "stroke": 0.1,
+      "fill": "lg",
+      "fill_zh": "大",
+      "fill_ratio": 0.8,
+      "name": "标准 + 大",
+      "ico": "tray-std-lg.ico",
+      "preview": "tray-std-lg-preview.png"
+    },
+    {
+      "id": "bold-sm",
+      "weight": "bold",
+      "weight_zh": "粗",
+      "stroke": 0.13,
+      "fill": "sm",
+      "fill_zh": "小",
+      "fill_ratio": 0.52,
+      "name": "粗 + 小",
+      "ico": "tray-bold-sm.ico",
+      "preview": "tray-bold-sm-preview.png"
+    },
+    {
+      "id": "bold-std",
+      "weight": "bold",
+      "weight_zh": "粗",
+      "stroke": 0.13,
+      "fill": "std",
+      "fill_zh": "标准",
+      "fill_ratio": 0.64,
+      "name": "粗 + 标准",
+      "ico": "tray-bold-std.ico",
+      "preview": "tray-bold-std-preview.png"
+    },
+    {
+      "id": "bold-lg",
+      "weight": "bold",
+      "weight_zh": "粗",
+      "stroke": 0.13,
+      "fill": "lg",
+      "fill_zh": "大",
+      "fill_ratio": 0.8,
+      "name": "粗 + 大",
+      "ico": "tray-bold-lg.ico",
+      "preview": "tray-bold-lg-preview.png"
+    }
+  ]
+}

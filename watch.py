@@ -273,8 +273,16 @@ def main():
 
     cond = source.Conditional()     # 记住「上次拿到的版本标记」，用来问「变了没有」
     tray = None
+    tray_style = ""
     if not NO_TRAY:
-        tray = tray_mod.Tray(resource_path("icon.ico"), menu_provider=tray_menu,
+        # 托盘图标样式：icons\ 下有 9 套（线条粗细 × 箭头占位大小），用户在设置
+        # 界面里随便挑。哨兵每轮都会重读配置，所以换样式是现场换图标，不用重启。
+        # 程序自己的 icon.ico 一直不变：它要出现在资源管理器里，浅色背景上
+        # 纯白线条会看不见。
+        tray_style = ((cfg.get("tray_style") or "").strip()
+                      or tray_mod.load_styles()[0])
+        tray = tray_mod.Tray(tray_mod.icon_path(tray_style),
+                             menu_provider=tray_menu,
                              on_default=open_settings, on_action=tray_action,
                              tip="win升级报告 · 正在启动")
         if tray.start():
@@ -412,6 +420,15 @@ def main():
 
                 # ---- 第 3 步：刷新托盘提示 + 写心跳 ----
                 if tray is not None and tray.alive:
+                    # 样式被改过就现场换图标。换失败也记下来，免得每轮重试刷屏。
+                    want = (cfg.get("tray_style") or "").strip()
+                    if want and want != tray_style:
+                        if tray.set_icon(tray_mod.icon_path(want)):
+                            say(f"托盘图标样式已切换：{want}")
+                        else:
+                            say(f"托盘图标样式切换失败：{want}", "WARN")
+                        tray_style = want
+
                     if now < silent_until:
                         mode_txt = "手动静默中"
                     elif in_game:

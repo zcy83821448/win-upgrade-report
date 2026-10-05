@@ -18,6 +18,7 @@ import channels as ch_mod                                                   # no
 import notify                                                               # noqa: E402
 import reporter                                                             # noqa: E402
 import deepseek_api                                                         # noqa: E402
+import tray as tray_mod                                                     # noqa: E402
 
 WATCH_TASK_NAME = "WinUpdReport_Watch"
 DAILY_TASK_NAME = "WinUpdReport_Daily"     # 旧版每日任务；装哨兵时顺手卸掉
@@ -785,6 +786,72 @@ class App:
         self._entry(p, 16, "每个频道最多保留报告数", "keep_reports", 8)
         self._check(p, 17, "自动收录 Flight Hub 上新出现的更新线（默认不启用）",
                     "auto_discover_channels")
+
+        # ---------- 托盘图标样式 ----------
+        ttk.Separator(p, orient="horizontal").grid(row=18, column=0, columnspan=3,
+                                                   sticky="ew", pady=8)
+        ttk.Label(p, text="任务栏图标样式").grid(row=19, column=0, sticky="w", pady=3)
+        self.tray_style_var = tk.StringVar()
+        self.tray_combo = ttk.Combobox(p, textvariable=self.tray_style_var,
+                                       state="readonly", width=16)
+        self.tray_combo.grid(row=19, column=1, sticky="w", padx=6)
+        self.tray_combo.bind("<<ComboboxSelected>>", self.on_tray_style)
+        ttk.Label(p, text="换完立刻生效，不用重启哨兵", foreground="#888"
+                  ).grid(row=19, column=2, sticky="w")
+        self.tray_prev_lbl = ttk.Label(p, text="")
+        self.tray_prev_lbl.grid(row=20, column=1, sticky="w", pady=(4, 0))
+        self._tray_prev_img = None
+        self._tray_style_map = {}
+        self._build_tray_style_list()
+
+    # ---- 托盘图标样式
+    def _build_tray_style_list(self):
+        """列出所有托盘图标样式（读 icons/styles.json，由 做图标.py 生成）。"""
+        default_id, styles = tray_mod.load_styles()
+        labels = []
+        for s in styles:
+            label = s.get("name") or s.get("id")
+            self._tray_style_map[label] = s["id"]
+            labels.append(label)
+        self.tray_combo.configure(values=labels)
+        cur = (self.cfg.get("tray_style") or "").strip() or default_id
+        matched = False
+        for label, sid in self._tray_style_map.items():
+            if sid == cur:
+                self.tray_style_var.set(label)
+                matched = True
+                break
+        if not matched and labels:          # 老配置里的样式 id 已经不存在了
+            self.tray_style_var.set(labels[0])
+        self._update_tray_preview()
+
+    def _update_tray_preview(self):
+        sid = self._tray_style_map.get(self.tray_style_var.get(), "")
+        p = tray_mod.preview_path(sid) if sid else ""
+        try:
+            if p and os.path.exists(p):
+                self._tray_prev_img = tk.PhotoImage(file=p)     # 必须留住引用
+                self.tray_prev_lbl.configure(image=self._tray_prev_img, text="")
+            else:
+                self.tray_prev_lbl.configure(image="", text="（没有预览图）")
+        except Exception as e:
+            self.tray_prev_lbl.configure(image="", text=f"预览显示失败：{e}")
+
+    def on_tray_style(self, event=None):
+        """换样式：存进配置，哨兵几秒内就会把托盘图标换掉。"""
+        sid = self._tray_style_map.get(self.tray_style_var.get(), "")
+        if not sid:
+            return
+        self.cfg["tray_style"] = sid
+        if not self.save(quiet=True):
+            return
+        self._update_tray_preview()
+        if load_watch().get("online"):
+            self.set_status(f"任务栏图标已换成「{self.tray_style_var.get()}」，"
+                            f"哨兵几秒内会换过来（看右下角托盘）。")
+        else:
+            self.set_status(f"任务栏图标已设为「{self.tray_style_var.get()}」。"
+                            f"后台哨兵没在跑，等它起来就是这个样式了。")
 
     def quiet_now(self):
         """手动静默：游戏识别不出来时兜底用（点一下 = 静默 2 小时，再点 = 取消）。"""
