@@ -34,6 +34,10 @@ NEW_CONSOLE = 0x00000010
 APP_TITLE = "win升级报告"
 FROZEN = is_frozen()
 
+# 设置窗口的初始尺寸。实际会用 _fit_window() 按「内容真正需要多大」再校正一次，
+# 这两个数只是下限（实测内容需要 876x763，这里留一点余量）。
+WIN_W, WIN_H = 890, 780
+
 
 def pythonw():
     exe = sys.executable
@@ -268,7 +272,11 @@ class App:
         self._live_lines = []
         self.log_tab = None
         root.title(APP_TITLE)
-        root.geometry("880x640")
+        # 窗口大小：原来写死 880x640，但内容实际需要 876x763，底部会被切掉。
+        # 现在先给一个够用的默认值，等所有控件都建好后再按「实际需要多大」校正一次
+        # （见 _fit_window），并且把最小值也定在那个尺寸上，
+        # 免得手一抖拖小了又把底部切掉。
+        root.geometry(f"{WIN_W}x{WIN_H}")
         root.minsize(820, 560)
 
         nb = ttk.Notebook(root)
@@ -319,9 +327,32 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.close_to_tray)
 
         self.reload_channels()
+        self._fit_window()                  # 按内容实际需要把窗口撑够，别切掉底部
         self.refresh_status()
         self.refresh_task_info_async()      # 查计划任务要 2 秒，放后台
         self.root.after(100, self._poll_results)   # 主线程轮询后台结果
+
+    def _fit_window(self):
+        """按内容的实际需要定窗口大小，保证每个标签页都完整显示。
+
+        为什么不能写死尺寸：内容高度取决于字体缩放（这里 tk scaling 设了 1.25）
+        和各页控件多少，写死就会出现「底部有东西显示不全」。
+        所以建完控件后量一次 winfo_reqwidth/reqheight，取「够用」的尺寸，
+        并把最小值也定在这里 —— 用户拖不小，也就不会再出现被切掉的情况。
+        """
+        try:
+            self.root.update_idletasks()
+            w = max(WIN_W, self.root.winfo_reqwidth() + 10)
+            h = max(WIN_H, self.root.winfo_reqheight() + 10)
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            w = max(640, min(w, sw - 40))       # 别超出屏幕
+            h = max(480, min(h, sh - 80))
+            self.root.geometry(f"{w}x{h}")
+            # 最小值就定在这个尺寸：拖不小，所以不会再出现「底部显示不全」
+            self.root.minsize(w, h)
+        except Exception:
+            pass
 
     # ================================================ 后台任务（不卡界面）
     def busy_run(self, fn, done=None, msg="处理中…", widgets=(), lock=True):
