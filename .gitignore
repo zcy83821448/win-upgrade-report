@@ -13,6 +13,11 @@ build/
 dist/
 *.spec
 
+# 打包输出（绿色文件夹 / zip / 单文件 exe）—— 不再进仓库。
+# 原因：以前每次重新打包都把 ~12 MB 的 exe 提交一次，.git 已经涨到 139 MB。
+# 下载统一走 GitHub Releases。
+应用程序/
+
 # 编辑器
 .vscode/
 .idea/
