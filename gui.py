@@ -864,9 +864,10 @@ class App:
 
         ttk.Separator(p, orient="horizontal").grid(row=9, column=0, columnspan=3,
                                                    sticky="ew", pady=8)
-        self._check(p, 10, "玩游戏时完全安静（不联网、不调 AI、不弹通知）",
+        self._check(p, 10, "全屏看视频 / 玩游戏时，先别打扰我"
+                           "（不联网、不调 AI、不弹通知）",
                     "game_mode_enabled")
-        self._entry(p, 11, "退出游戏后确认几秒才恢复", "game_exit_hold_seconds", 6,
+        self._entry(p, 11, "退出全屏后确认几秒才恢复", "game_exit_hold_seconds", 6,
                     "防止切进切出时通知乱弹")
         ttk.Label(p, text="怎么认出来的：有窗口铺满整块屏幕 + 没有标题栏 + 不是系统组件。"
                           "无边框全屏的游戏正好符合。\n"
@@ -1495,7 +1496,7 @@ class App:
         gaming = (w.get("mode") == "game")
         if online and gaming:
             dot, color = "●", "#d97706"
-            title = "后台正在运行　（你正在玩游戏，它先不打扰你）"
+            title = "后台正在运行　（你现在全屏用着东西，它先不打扰你）"
         elif online:
             dot, color = "●", "#16a34a"
             title = "后台正在运行"
@@ -1542,7 +1543,7 @@ class App:
 
         # 哨兵现在怎么样（有没有在跑、是不是因为游戏静默了）
         if online:
-            mode = {"game": "游戏静默中", "paused": "已暂停（没启用）"}.get(
+            mode = {"game": "全屏中（先不打扰你）", "paused": "已暂停（没启用）"}.get(
                 w.get("mode"), "正常")
             watch_txt = (f"后台：运行中　状态：{mode}　"
                          f"上次问官方：{w.get('last_check') or '还没问过'}　"

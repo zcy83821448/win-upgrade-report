@@ -90,12 +90,47 @@ def _pythonw():
     return exe
 
 
+def _clean_env():
+    """给子进程一份干净的环境变量：把 PyInstaller 单文件版注入的那些去掉。
+
+    为什么必须去掉（这是实测踩到的坑）：
+        单文件 exe 启动时会把自己解包到 %TEMP%\\_MEIxxxx，并把这个路径写进
+        环境变量 _MEIPASS2 传给它启动的子进程。子进程看到 _MEIPASS2 就直接
+        **复用同一个目录、不再解包**（本来是为了快）。但这个目录是「谁解包谁负责删」：
+          * 哨兵一退出就把目录删了，而还在复用它的设置界面会当场崩掉；
+          * 复用期间目录被临时文件清理工具动过，新进程就会起不来，弹
+            「Failed to start embedded python interpreter!」（用户实测遇到过）。
+        所以这里干脆让子进程自己重新解包一份：多花 1~2 秒，换来绝对不会因为
+        共用临时目录而出问题。
+    """
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith("_MEI") or k.startswith("_PYI"):
+            env.pop(k, None)
+    return env
+
+
 def _spawn(args):
     try:
-        subprocess.Popen(args, cwd=BASE_DIR, creationflags=NO_WINDOW)
+        subprocess.Popen(args, cwd=BASE_DIR, creationflags=NO_WINDOW,
+                         env=_clean_env())
         return True
     except Exception as e:
         say(f"启动外部程序失败：{e}", "WARN")
+        return False
+
+
+def open_program_folder():
+    """打开程序所在的文件夹。
+
+    这是「万一设置界面起不来」的兜底出口：让用户能自己去双击那个 exe。
+    """
+    d = (os.path.dirname(os.path.abspath(sys.executable))
+         if is_frozen() else BASE_DIR)
+    try:
+        os.startfile(d)                    # noqa: S606
+        return True
+    except Exception:
         return False
 
 
@@ -127,8 +162,10 @@ def tray_menu():
     if st.get("silent"):
         mode = "手动静默中"
     else:
-        mode = {"game": "游戏静默中", "paused": "已暂停"}.get(st.get("mode"),
-                                                              "运行中")
+        # 说「全屏中」而不是「游戏静默中」：实测全屏看视频也会触发，
+        # 写「游戏」会让用户莫名其妙（我没玩游戏啊）。
+        mode = {"game": "全屏中（先不打扰你）", "paused": "已暂停"}.get(
+            st.get("mode"), "运行中")
     items = [
         {"id": "", "label": f"状态：{mode}", "enabled": False},
         {"id": "", "label": f"上次问官方：{st.get('last_check') or '还没问过'}",
@@ -136,7 +173,7 @@ def tray_menu():
     ]
     if st.get("game_exe"):
         items.append({"id": "", "enabled": False,
-                      "label": "静默原因：" + os.path.basename(st["game_exe"])})
+                      "label": "全屏的程序：" + os.path.basename(st["game_exe"])})
     items += [
         {"sep": True},
         {"id": "open", "label": "打开设置界面"},
@@ -146,6 +183,7 @@ def tray_menu():
         {"sep": True},
         {"id": "index", "label": "打开报告总览"},
         {"id": "log", "label": "打开日志"},
+        {"id": "folder", "label": "打开程序文件夹（界面打不开时用）"},
         {"sep": True},
         {"id": "quit", "label": "完全关闭后台监控"},
     ]
@@ -179,6 +217,9 @@ def tray_action(name):
         open_viewer("index")
     elif name == "log":
         open_log()
+    elif name == "folder":
+        say("托盘菜单：打开程序文件夹")
+        open_program_folder()
     elif name == "quit":
         say("托盘菜单：完全关闭后台监控")
         # 先关开关再发退出请求：这样即使计划任务把它重启，它一启动就自己退出
@@ -230,7 +271,7 @@ def show_status():
             print(f"  最后的记录：{w.get('last_tick') or '无'}"
                   f"　模式：{w.get('mode') or '?'}")
         return 1
-    mode = {"game": "游戏静默中", "paused": "已暂停（没后台监控）"}.get(
+    mode = {"game": "全屏中（先不打扰你）", "paused": "已暂停（没后台监控）"}.get(
         w.get("mode"), "正常")
     print(f"哨兵：运行中（进程 {w.get('pid')}）")
     print(f"  当前状态  ：{mode}"
@@ -360,7 +401,7 @@ def main():
                     if not in_game:
                         in_game = True
                         last_hb = 0
-                        say(f"进入静默：{game_exe} 正在全屏运行。"
+                        say(f"进入安静模式：{game_exe} 正在全屏。"
                             f"这段时间不联网、不调 AI、不通知。")
                 else:
                     if in_game:
@@ -372,7 +413,7 @@ def main():
                             clear_streak = 0
                             next_poll = 0     # 补查：玩游戏期间可能发了新版本
                             last_hb = 0
-                            say("退出静默（游戏已关闭），立刻补查一次")
+                            say("退出全屏，立刻补查一次")
                     else:
                         clear_streak = 0
 
@@ -432,7 +473,7 @@ def main():
                     if now < silent_until:
                         mode_txt = "手动静默中"
                     elif in_game:
-                        mode_txt = "游戏静默中"
+                        mode_txt = "全屏中（先不打扰你）"
                     else:
                         mode_txt = "运行中"
                     tip = (f"win升级报告 · {mode_txt}"
