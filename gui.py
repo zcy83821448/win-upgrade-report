@@ -1,22 +1,36 @@
 # -*- coding: utf-8 -*-
-"""设置界面：挑更新线、改 API / 时间 / 间隔，装计划任务，看日志。"""
-import os
-import sys
-import queue
-import threading
-import subprocess
+"""设置界面后端：pywebview 原生窗口（WebView2）+ JS API。
+
+界面文件在 webui/（index.html / app.css / app.js）。前端通过
+window.pywebview.api.<方法> 调用本文件里的 GuiApi，接口约定见 CONTRACT.md。
+
+本文件后半部分是 GuiApi（唯一给前端用的接口）和 main()（起原生窗口）。
+前半部分全是模块级 helper：打包 / 计划任务 / 开机自启 / 子进程相关的老代码，
+被 selfcheck.py、app.py 直接 import，名字和签名不能动。
+"""
+import base64
+import ctypes
+import ctypes.wintypes as wt
 import datetime as dt
-import tkinter as tk
-from tkinter import ttk, messagebox
+import functools
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import (load_config, save_config, load_state, channel_state,   # noqa: E402
+from config import (load_config, save_config, load_state, save_state, channel_state,   # noqa: E402
                     resolve_api_key, mask_key, BASE_DIR, REPORT_DIR, LOG_DIR,
-                    resource_path, is_frozen, app_exe, child_env,
+                    DEFAULTS, resource_path, is_frozen, app_exe, child_env,
                     load_watch, request_check_now, request_exit, patch_config)
 import channels as ch_mod                                                   # noqa: E402
 import notify                                                               # noqa: E402
 import reporter                                                             # noqa: E402
+import mdlite                                                               # noqa: E402
 import deepseek_api                                                         # noqa: E402
 import tray as tray_mod                                                     # noqa: E402
 import selfcheck                                                            # noqa: E402
@@ -35,9 +49,12 @@ NEW_CONSOLE = 0x00000010
 APP_TITLE = "win升级报告"
 FROZEN = is_frozen()
 
-# 设置窗口的初始尺寸。实际会用 _fit_window() 按「内容真正需要多大」再校正一次，
-# 这两个数只是下限（实测内容需要 876x763，这里留一点余量）。
-WIN_W, WIN_H = 890, 780
+# 窗口默认尺寸（逻辑像素）。frameless 切换会让 WinForms 把窗口缩掉一圈，
+# 所以窗口显示出来后再按这两个数校正一次（见 _fix_initial_size）。
+WINDOW_W, WINDOW_H = 1120, 780
+
+# 「报告详细程度」的可选值（前端下拉用）
+DETAIL_OPTIONS = list(deepseek_api.DETAIL_SPEC.keys())
 
 
 def pythonw():
@@ -267,710 +284,654 @@ def toggle_startup():
             if os.path.exists(link) else "设置失败")
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.cfg = load_config()
-        self.state = load_state()
-        self.rows = []          # 界面里的更新线列表
-        self._busy = False
+# =========================================================== 小工具 / 错误日志
+
+def _now_iso():
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _as_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "是")
+
+
+def _error_log_path():
+    return os.path.join(LOG_DIR, "gui_error.log")
+
+
+def write_error_line(text):
+    """把一行错误写进 logs\\gui_error.log（写不进去也不能影响界面）。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(_error_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {text}\n")
+    except Exception:
+        pass
+
+
+def log_exception(context):
+    """记录当前异常堆栈。所有 JS API 的异常都走这里，绝不穿透给前端。"""
+    try:
+        write_error_line(context + "\n" + traceback.format_exc())
+    except Exception:
+        pass
+
+
+def _guard(fn):
+    """给每个 JS API 方法兜底：任何异常都记日志并返回人话错误。"""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception:
+            log_exception(f"{fn.__name__}() 出错")
+            return {"ok": False,
+                    "error": "界面后台出了点状况，已经记到日志里；可以点「体检并自动修复」试试。"}
+
+    return wrapper
+
+
+def _normalize_quiet_hours(spec):
+    """"23:00-07:00" -> 规范化后的字符串；不合规返回 None。"""
+    try:
+        a, b = str(spec).split("-", 1)
+        a, b = a.strip(), b.strip()
+        for t in (a, b):
+            hh, mm = t.split(":")
+            dt.time(int(hh), int(mm))
+        return f"{a}-{b}"
+    except Exception:
+        return None
+
+
+def _normalize_check_time(spec):
+    """旧的「每天检测时间」：不合法就退回 12:00，绝不因此挡住保存。"""
+    try:
+        hh, mm = str(spec or "").strip().split(":")
+        dt.time(int(hh), int(mm))
+        return f"{int(hh):02d}:{int(mm):02d}"
+    except Exception:
+        return "12:00"
+
+
+_REPORT_NAME_RE = re.compile(r"更新报告_([0-9]+(?:-[0-9]+)*)_(\d{4}-\d{2}-\d{2})")
+_REPORT_EMBED_CSS = """<style id="winupd-embed">
+/* 这份样式是设置界面在 iframe 里内嵌报告时注入的：去掉页面自己的背景、留白和阴影，
+   让报告看起来是界面的一部分而不是另一个网站。 */
+html,body{background:#fff !important;padding:0 !important;margin:0 !important;color-scheme:light}
+body{color:#1C1B19 !important}
+main{box-shadow:none !important;border-radius:0 !important;max-width:none !important;
+ margin:0 !important;padding:28px 40px !important;background:#fff !important}
+a{color:#1F5AE0 !important}
+/* 应用内嵌字号：报告页自带的 PAGE 样式是「网页阅读」尺寸（h1 27px 等），
+   塞进宽约 480px 的右侧面板后标题会被折成好几行、正文也偏大。这里整体降一档，
+   全屏阅读器用同一套也合适。字号/间距放媒体查询前面，深色那套颜色仍然最后生效。 */
+body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif !important;
+ font-size:13.5px !important;line-height:1.7 !important}
+main{padding:24px 30px !important}
+h1{font-size:21px !important;line-height:1.35 !important;margin:0 0 8px !important}
+h2{font-size:16.5px !important;margin:22px 0 8px !important;padding-bottom:5px !important}
+h3{font-size:14.5px !important;margin:16px 0 6px !important}
+h4{font-size:13.5px !important}
+p,li{font-size:13.5px !important;margin:6px 0 !important}
+ul,ol{padding-left:20px !important}
+table{font-size:12.5px !important}
+code,pre{font-size:12px !important}
+blockquote{font-size:13px !important}
+@media (prefers-color-scheme:dark){
+ html,body{background:#fff !important;color:#1C1B19 !important}
+ body{color:#1C1B19 !important}
+ main{background:#fff !important;color:#1C1B19 !important;box-shadow:none !important}
+ h1,h2,h3,h4,p,li,td,th,blockquote{color:#1C1B19 !important}
+ h2{border-color:#E7E3DC !important}
+ code,pre{background:#F6F5F2 !important;color:#1C1B19 !important;border-color:#E7E3DC !important}
+ th{background:#FBFAF7 !important}
+ th,td,hr{border-color:#E7E3DC !important}
+ blockquote{background:#F4F8FF !important}
+ a{color:#1F5AE0 !important}
+}
+</style>"""
+
+
+def _inject_report_css(html):
+    """把「贴合应用内嵌」的 CSS 注入到报告 HTML 里（放在 </style> 之前，不破坏原样式）。"""
+    try:
+        low = html.lower()
+        if "</style>" in low:
+            i = low.rfind("</style>")
+            return html[:i] + _REPORT_EMBED_CSS + html[i:]
+        if "</head>" in low:
+            i = low.rfind("</head>")
+            return html[:i] + _REPORT_EMBED_CSS + html[i:]
+        return _REPORT_EMBED_CSS + html
+    except Exception:
+        return html
+
+
+def _html_title(html):
+    m = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.S | re.I)
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()[:120]
+
+
+def _row_sort_key(c):
+    """更新线排序：Flight Hub 在前按 FH_ORDER，uupdump 在后按 UUP_ORDER，再按名称。"""
+    name = c.get("name") or c.get("id") or ""
+    if c.get("source") == "flighthub":
+        folder = c.get("folder") or ""
+        order = ch_mod.FH_ORDER.index(folder) if folder in ch_mod.FH_ORDER else 99
+        return (0, order, name)
+    cat = c.get("category") or ""
+    order = ch_mod.UUP_ORDER.index(cat) if cat in ch_mod.UUP_ORDER else 99
+    return (1, order, name)
+
+
+# =========================================================== 自绘标题栏用的 Win32
+# 窗口是 frameless 的：原生标题栏、边框、缩放边都不存在，最小化/最大化/缩放
+# 由前端按钮 + 这里的 Win32 调用接管。句柄一律声明成指针，免得 64 位下被截断。
+VK_LBUTTON = 0x01
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SW_RESTORE = 9
+MONITOR_DEFAULTTONEAREST = 2
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_DONOTROUND = 1
+DWMWCP_ROUND = 2
+RESIZE_MIN_W = 960          # 逻辑像素；实际 clamp 时按窗口所在显示器 DPI 换算
+RESIZE_MIN_H = 640
+RESIZE_POLL_SECONDS = 0.012
+RESIZE_MAX_SECONDS = 60
+
+
+class _WinRect(ctypes.Structure):
+    _fields_ = [("left", wt.LONG), ("top", wt.LONG),
+                ("right", wt.LONG), ("bottom", wt.LONG)]
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", _WinRect),
+                ("rcWork", _WinRect), ("dwFlags", wt.DWORD)]
+
+
+_WIN32_READY = False
+_u32 = None
+_dwm = None
+
+
+def _win32():
+    """拿到 (user32, dwmapi) 并声明函数签名。只初始化一次。
+
+    ★ 必须用独立的 WinDLL 实例，不能改 ctypes.windll.user32 上的函数签名：
+      pywebview 自己也调 windll.user32.SetWindowPos，它给 cx/cy 传的是 None
+      （配合 SWP_NOSIZE）。我们一旦在共享实例上把参数声明成 c_int，它的
+      `.pywebview-drag-region` 拖动就会抛 "argument 5: TypeError: wrong type"。
+    """
+    global _WIN32_READY, _u32, _dwm
+    if _u32 is None:
+        _u32 = ctypes.WinDLL("user32")
+        _dwm = ctypes.WinDLL("dwmapi")
+    u, d = _u32, _dwm
+    if not _WIN32_READY:
+        try:
+            u.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+            u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WinRect)]
+            u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_uint]
+            u.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            u.MonitorFromWindow.restype = ctypes.c_void_p
+            u.GetMonitorInfoW.argtypes = [ctypes.c_void_p,
+                                          ctypes.POINTER(_MonitorInfo)]
+            u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+            u.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+            u.IsWindow.argtypes = [ctypes.c_void_p]
+            u.IsIconic.argtypes = [ctypes.c_void_p]
+            u.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            u.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+            u.FindWindowW.restype = ctypes.c_void_p
+            u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                                   ctypes.POINTER(wt.DWORD)]
+            d.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                ctypes.c_void_p, ctypes.c_uint]
+            d.DwmSetWindowAttribute.restype = ctypes.c_long
+            _WIN32_READY = True
+        except Exception:
+            pass
+    return u, d
+
+
+# ================================================================== JS 后端
+
+class GuiApi:
+    """pywebview 的 js_api 后端。
+
+    所有方法都在 pywebview 的工作线程里被调用（每一次调用一个线程），所以：
+      * 共享数据一律走 self._lock（RLock）；
+      * 后台线程只往 self._events 里追加事件，绝不直接碰 WebView 对象；
+      * 前端每 1000ms 调一次 poll()，一次把事件全部取走。
+    """
+
+    _INT_KEYS = ("max_tokens", "request_timeout", "retries", "max_workers",
+                 "max_context_chars", "interval_days", "keep_reports",
+                 "notify_on_error_after", "watch_interval_minutes",
+                 "game_exit_hold_seconds", "tick_seconds")
+    _FLOAT_KEYS = ("temperature",)
+    _BOOL_KEYS = ("notify", "merge_notifications", "include_official_text",
+                  "disable_thinking", "auto_discover_channels", "watch_enabled",
+                  "game_mode_enabled", "run_once_per_day", "check_at_logon",
+                  "tray_hint_shown", "open_report_on_click")
+    _STR_KEYS = ("api_base", "api_key", "model", "proxy", "detail", "app_id",
+                 "report_dir", "silent_until", "check_time", "uup_url",
+                 "tray_style", "quiet_hours")
+    _KNOWN_KEYS = frozenset(DEFAULTS.keys())
+    _LABELS = {
+        "watch_interval_minutes": "多久检查一次（分钟）",
+        "game_exit_hold_seconds": "退出全屏后确认几秒",
+        "notify_on_error_after": "连续失败几次后提醒我",
+        "keep_reports": "每份报告最多保留几份",
+        "max_tokens": "单次回答最多多少词",
+        "request_timeout": "网络超时（秒）",
+        "retries": "失败重试几次",
+        "max_context_chars": "喂给 AI 的原文上限",
+        "max_workers": "同时抓几条线",
+        "interval_days": "间隔天数",
+        "tick_seconds": "哨兵醒来间隔",
+        "temperature": "随机程度",
+    }
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._cfg = load_config()
+        self._state = load_state(force=True)
+        self._rows = []            # 更新线列表（含预设）
+        self._events = []          # 待前端取走的事件
         self._task_text = "正在查询计划任务…"
-        self._results = queue.Queue()
+        self._task_querying = False
+        self._busy_text = ""       # 非空 = 有一个长操作在跑
+        self._live_active = False
         self._live_lines = []
-        self.log_tab = None
-        root.title(APP_TITLE)
-        # 窗口大小：原来写死 880x640，但内容实际需要 876x763，底部会被切掉。
-        # 现在先给一个够用的默认值，等所有控件都建好后再按「实际需要多大」校正一次
-        # （见 _fit_window），并且把最小值也定在那个尺寸上，
-        # 免得手一抖拖小了又把底部切掉。
-        root.geometry(f"{WIN_W}x{WIN_H}")
-        root.minsize(820, 560)
+        self._live_rc = None
+        # ★ 窗口对象必须是私有属性：pywebview 会递归 dir() 所有公开属性来生成
+        #   JS API 表，公开的窗口属性会把 .NET / WinForms / COM 对象全遍历一遍，
+        #   在 stderr 刷一堆 "Error while processing window.native..."。
+        self._window = None
+        self._hwnd_cache = 0
+        self._maximized = False          # 自绘最大化的状态（poll 里同步给前端）
+        self._normal_rect = None         # 还原时用的原矩形 (x, y, w, h)
+        self._max_lock = threading.Lock()
+        self._resize_alive = False
+        self._reload_rows()
+        self._query_task_info_async()
 
-        # ---- 顶部常驻状态卡片：不管在哪个标签页，都能一眼看到「它在不在跑」----
-        self._build_hero(root)
+    # ============================================================ 初始数据
 
-        nb = ttk.Notebook(root)
-        nb.pack(fill="both", expand=True, padx=10, pady=(4, 4))
-        self.t_chan = ttk.Frame(nb, padding=10)
-        self.t_detect = ttk.Frame(nb, padding=12)
-        self.t_api = ttk.Frame(nb, padding=12)
-        self.t_task = ttk.Frame(nb, padding=12)
-        self.t_log = ttk.Frame(nb, padding=12)
-        # 标签名一律按「用户想干什么」起，不用实现细节：
-        # 「计划任务」「DeepSeek API」「并发线程数」这类词普通人不知道是什么。
-        nb.add(self.t_chan, text="  更新线  ")       # 我要盯哪几条线
-        nb.add(self.t_detect, text="  通知  ")       # 什么时候提醒我、怎么提醒
-        nb.add(self.t_api, text="  设置  ")          # AI 的 Key（必填）+ 高级选项
-        nb.add(self.t_task, text="  开机自启  ")     # 让它开机自己跑起来
-        nb.add(self.t_log, text="  日志与诊断  ")    # 出问题了看这里
-        self.nb = nb
-        self.log_tab = self.t_log
-        nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+    @_guard
+    def bootstrap(self):
+        """首屏要用的全部数据。慢的（计划任务）已经在后台查了，不等它。"""
+        with self._lock:
+            self._cfg = load_config()
+            self._state = load_state(force=True)
+            self._reload_rows()
+            cfg = self._cfg
+            state = self._state
+            channels = self._channels_payload()
+            watch = self._watch_payload()
+            task_text = self._task_text
+            task_querying = self._task_querying
+        if not task_querying:
+            self._query_task_info_async()
+        return {
+            "ok": True,
+            "app": self._app_info(),
+            "config": cfg,
+            "state": state,
+            "watch": watch,
+            "channels": channels,
+            "reports": self._collect_reports(),
+            "tray_styles": self._tray_styles(cfg),
+            "detail_options": list(DETAIL_OPTIONS),
+            "task_text": task_text,
+            "startup": {"enabled": os.path.exists(startup_link())},
+            "now": _now_iso(),
+        }
 
-        self.v = {}
-        self._build_chan(self.t_chan)
-        self._build_detect(self.t_detect)
-        self._build_api(self.t_api)
-        self._build_task(self.t_task)
-        self._build_log(self.t_log)
+    @_guard
+    def poll(self):
+        """前端每秒调一次：轻量状态 + 本秒内的事件。"""
+        with self._lock:
+            watch = self._watch_payload()
+            task_text = self._task_text
+            live = {
+                "active": bool(self._live_active),
+                "lines": list(self._live_lines[-400:]),
+                "rc": self._live_rc,
+            }
+            events = self._events[:]
+            self._events.clear()
+            window = {"maximized": bool(self._maximized)}
+        return {
+            "ok": True,
+            "now": _now_iso(),
+            "watch": watch,
+            "startup": {"enabled": os.path.exists(startup_link())},
+            "window": window,
+            "task_text": task_text,
+            "live": live,
+            "events": events,
+        }
 
-        bar = ttk.Frame(root, padding=(12, 0, 12, 4))
-        bar.pack(fill="x")
-        self.status = ttk.Label(bar, text="", foreground="#0a6cff", wraplength=880,
-                                justify="left")
-        self.status.pack(anchor="w")
+    # ============================================================ 更新线
 
-        btns = ttk.Frame(root, padding=(12, 4, 12, 12))
-        btns.pack(fill="x")
-        ttk.Button(btns, text="保存设置", command=self.save).pack(side="left")
-        self.btn_selfcheck = ttk.Button(btns, text="体检并自动修复",
-                                        command=self.run_selfcheck)
-        self.btn_selfcheck.pack(side="left", padx=6)
-        self.btn_check = ttk.Button(btns, text="立刻检测一遍（过程显示在日志里）",
-                                    command=lambda: self.run_check_live())
-        self.btn_check.pack(side="left", padx=6)
-        self.btn_toast = ttk.Button(btns, text="发一条测试通知", command=self.test_toast)
-        self.btn_toast.pack(side="left")
-        # 关闭按钮的文字和可见性跟着后台状态走（见 refresh_status）：
-        # 后台没在跑的时候写「关闭到托盘」是误导 —— 那时候压根没有托盘图标。
-        self.btn_quit_all = ttk.Button(btns, text="完全退出", command=self.quit_all)
-        self.btn_quit_all.pack(side="right")
-        self.btn_close = ttk.Button(btns, text="关闭窗口", command=self.close_to_tray)
-        self.btn_close.pack(side="right", padx=6)
-        root.protocol("WM_DELETE_WINDOW", self.close_to_tray)
-
-        self.reload_channels()
-        self._fit_window()                  # 按内容实际需要把窗口撑够，别切掉底部
-        self.refresh_status()
-        self.refresh_task_info_async()      # 查计划任务要 2 秒，放后台
-        self.root.after(100, self._poll_results)   # 主线程轮询后台结果
-
-    # ========================================== 顶部状态卡片（一眼看懂）
-    def _build_hero(self, root):
-        """最上面那块常驻区域：它在不在跑、在盯什么、还缺什么、一键开关。
-
-        为什么放最上面而不是塞进某个标签页：用户最想知道的其实只有一件事
-        ——「它现在到底有没有在帮我盯着」。这句话藏在第 4 个标签页里等于没有。
-        """
-        bg, line = "#f4f7fc", "#d8e2f2"
-        card = tk.Frame(root, bg=bg, highlightbackground=line,
-                        highlightthickness=1)
-        card.pack(fill="x", padx=10, pady=(10, 4))
-        inner = tk.Frame(card, bg=bg)
-        inner.pack(fill="x", padx=14, pady=11)
-        inner.columnconfigure(1, weight=1)
-
-        self.hero_dot = tk.Label(inner, text="○", bg=bg, fg="#98a2b3",
-                                 font=("Microsoft YaHei", 17))
-        self.hero_dot.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 8))
-        self.hero_title = tk.Label(inner, text="正在读状态…", bg=bg, fg="#111827",
-                                   font=("Microsoft YaHei", 13, "bold"))
-        self.hero_title.grid(row=0, column=1, sticky="w")
-        self.hero_sub = tk.Label(inner, text="", bg=bg, fg="#4b5563",
-                                 font=("Microsoft YaHei", 9), justify="left")
-        self.hero_sub.grid(row=1, column=1, sticky="w", pady=(3, 0))
-        self.hero_hint = tk.Label(inner, text="", bg=bg, fg="#b45309",
-                                  font=("Microsoft YaHei", 9), justify="left")
-        self.hero_hint.grid(row=2, column=1, sticky="w", pady=(4, 0))
-
-        right = tk.Frame(inner, bg=bg)
-        right.grid(row=0, column=2, rowspan=3, sticky="e")
-        self.btn_hero = ttk.Button(right, text="开启后台监控", width=15,
-                                   command=self.hero_toggle)
-        self.btn_hero.pack(anchor="e")
-        row2 = tk.Frame(right, bg=bg)
-        row2.pack(anchor="e", pady=(6, 0))
-        ttk.Button(row2, text="立刻检查", width=9,
-                   command=lambda: self.run_silent(["--force"])
-                   ).pack(side="left")
-        ttk.Button(row2, text="看报告", width=9,
-                   command=self.open_index).pack(side="left", padx=(6, 0))
-
-    def hero_toggle(self):
-        """顶部那个开关：开 / 停后台监控。"""
-        if load_watch().get("online"):
-            self.stop_watch()
-            self.set_status("已停止后台监控，托盘图标几秒内消失。")
-            self.root.after(1800, self.refresh_status)
-            return
-        if not resolve_api_key(self.cfg):
-            self.set_status("先去「设置」页填一个 AI 的 Key —— "
-                            "不填的话就算发现新版本也写不出中文报告。", "#b45309")
+    @_guard
+    def channels(self):
+        with self._lock:
+            self._state = load_state(force=True)
             try:
-                self.nb.select(self.t_api)
+                disk_cfg = load_config()
             except Exception:
-                pass
-            return
-        self.start_watch()
+                disk_cfg = self._cfg
+            self._merge_rows_from_cfg(disk_cfg)
+            self._cfg = disk_cfg
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload}
 
-    def stop_watch(self):
-        """停掉后台哨兵（但不关窗口）。"""
-        self.cfg["watch_enabled"] = False      # 内存里也同步，免得之后保存设置写回旧值
-        selfcheck.stop_sentinel()
-
-    def _fit_window(self):
-        """按内容的实际需要定窗口大小，保证每个标签页都完整显示。
-
-        为什么不能写死尺寸：内容高度取决于字体缩放（这里 tk scaling 设了 1.25）
-        和各页控件多少，写死就会出现「底部有东西显示不全」。
-        所以建完控件后量一次 winfo_reqwidth/reqheight，取「够用」的尺寸，
-        并把最小值也定在这里 —— 用户拖不小，也就不会再出现被切掉的情况。
-        """
-        try:
-            self.root.update_idletasks()
-            w = max(WIN_W, self.root.winfo_reqwidth() + 10)
-            h = max(WIN_H, self.root.winfo_reqheight() + 10)
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            w = max(640, min(w, sw - 40))       # 别超出屏幕
-            h = max(480, min(h, sh - 80))
-            self.root.geometry(f"{w}x{h}")
-            # 最小值就定在这个尺寸：拖不小，所以不会再出现「底部显示不全」
-            self.root.minsize(w, h)
-        except Exception:
-            pass
-
-    # ================================================ 后台任务（不卡界面）
-    def busy_run(self, fn, done=None, msg="处理中…", widgets=(), lock=True):
-        """把 fn 丢到线程里跑，完成后回主线程调 done(result, error)。
-
-        Tk 只能在主线程碰：工作线程把结果丢进队列，主线程的轮询器取出来再更新界面。
-        lock=False 用于启动时的只读查询，不占用「同一时间只做一个操作」的锁。
-        """
-        if lock and self._busy:
-            self.set_status("上一个操作还没结束，稍等一下", "#c00")
-            return
-        self._busy = self._busy or lock
-        for w in widgets:
-            try:
-                w.configure(state="disabled")
-            except Exception:
-                pass
-        if msg:
-            self.set_status(msg)
-
-        def worker():
-            try:
-                res, err = fn(), None
-            except Exception as e:
-                res, err = None, e
-            # 这里绝对不能碰任何 Tk 对象，只放队列
-            self._results.put((res, err, done, widgets, lock))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _poll_results(self):
-        """主线程轮询：先刷新实时输出，再取走工作线程的成果。"""
-        if self._live_lines:
-            lines, self._live_lines = self._live_lines[:], []
-            self.append_log(lines)
-            self.set_status(lines[-1][:120])
-        try:
-            while True:
-                res, err, done, widgets, lock = self._results.get_nowait()
-                self._busy_done(res, err, done, widgets, lock)
-        except queue.Empty:
-            pass
-        except Exception as e:
-            self.set_status(f"后台任务回调出错：{e}", "#c00")
-        self.root.after(100, self._poll_results)
-
-    def append_log(self, lines):
-        try:
-            self.logbox.configure(state="normal")
-            self.logbox.insert("end", "\n".join(lines) + "\n")
-            self.logbox.see("end")
-            self.logbox.configure(state="disabled")
-        except Exception:
-            pass
-
-    def _busy_done(self, res, err, done, widgets, lock=True):
-        if lock:
-            self._busy = False
-        for w in widgets:
-            try:
-                w.configure(state="normal")
-            except Exception:
-                pass
-        if done:
-            try:
-                done(res, err)
-            except Exception as e:
-                self.set_status(f"回调出错：{e}", "#c00")
-        elif err:
-            self.set_status(f"出错：{err}", "#c00")
-
-    def refresh_task_info_async(self, after=None):
-        """计划任务状态只在装/卸之后才会变，所以查一次缓存起来，别每次点按钮都查。
-        只读查询，不占锁、不改状态栏，免得刚开窗口的 2 秒里用户点什么都被挡。"""
-        self.busy_run(task_info,
-                      lambda r, e: self._set_task_text(r if not e else f"查询失败：{e}",
-                                                       now=after),
-                      msg=None, lock=False)
-
-    def _set_task_text(self, text, now=None):
-        self._task_text = text or "未安装计划任务"
-        try:
-            self.task_lbl.configure(text=self._task_text)
-        except Exception:
-            pass
-        if now:
-            now()
-
-    def on_tab_changed(self, event=None):
-        try:
-            if self.nb.nametowidget(self.nb.select()) is self.log_tab:
-                self.load_log()
-        except Exception:
-            pass
-
-    # ======================================================== 更新线
-    def _build_chan(self, p):
-        ttk.Label(p, text="这里决定它帮你盯哪几条 Windows 更新线。"
-                          "至少勾一条，它才有东西可查。",
-                  foreground="#4b5563", justify="left").pack(anchor="w", pady=(0, 6))
-        top = ttk.Frame(p)
-        top.pack(fill="x")
-        ttk.Label(top, text="要盯的更新线", font=("", 11, "bold")).pack(side="left")
-        self.btn_discover = ttk.Button(top, text="刷新一下可选的线",
-                                       command=self.discover)
-        self.btn_discover.pack(side="right")
-        ttk.Label(p, text="勾选 = 盯这条线（双击一行也行，选中一行在下面看详情）。\n"
-                          "一般只勾你正在用的那条就够了；不确定就留着默认那条。",
-                  foreground="#888", justify="left").pack(anchor="w", pady=(2, 6))
-
-        mid = ttk.Frame(p)
-        mid.pack(fill="both", expand=True)
-        cols = ("on", "name", "src", "ver", "chk", "rep")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=13,
-                                 selectmode="browse")
-        for c, txt, w in (("on", "启用", 48), ("name", "更新线", 240),
-                          ("src", "来源", 90), ("ver", "当前记录版本", 130),
-                          ("chk", "上次检测", 100), ("rep", "最近报告", 110)):
-            self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor="w" if c in ("name", "src") else "center")
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("off", foreground="#9aa0ad")
-        self.tree.bind("<Double-1>", self.toggle_row)
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_detail())
-
-        add = ttk.Frame(p)
-        add.pack(fill="x", pady=(6, 0))
-        ttk.Label(add, text="添加自定义 uupdump 分类/网址").pack(side="left")
-        self.custom = tk.StringVar()
-        ttk.Entry(add, textvariable=self.custom, width=34).pack(side="left", padx=6)
-        ttk.Button(add, text="添加", command=self.add_custom).pack(side="left")
-        ttk.Button(add, text="启用/停用选中", command=self.toggle_sel).pack(side="left", padx=8)
-        ttk.Button(add, text="全部启用", command=lambda: self.set_all(True)).pack(side="left")
-        ttk.Button(add, text="全部停用", command=lambda: self.set_all(False)).pack(side="left", padx=4)
-
-        det = ttk.LabelFrame(p, text="选中这条线的操作", padding=8)
-        det.pack(fill="x", pady=(8, 0))
-        self.detail = ttk.Label(det, text="选一行看看", justify="left")
-        self.detail.grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 6))
-        ttk.Button(det, text="只检测这条线（弹窗）",
-                   command=self.check_selected).grid(row=1, column=0, padx=(0, 6))
-        ttk.Button(det, text="打开最近报告",
-                   command=self.open_selected_report).grid(row=1, column=1, padx=6)
-        ttk.Button(det, text="打开报告文件夹",
-                   command=self.open_selected_dir).grid(row=1, column=2, padx=6)
-        ttk.Button(det, text="忽略当前版本",
-                   command=self.ignore_current).grid(row=1, column=3, padx=6)
-        ttk.Button(det, text="清除忽略",
-                   command=self.clear_ignored).grid(row=1, column=4, padx=6)
-        ttk.Label(det, text="架构").grid(row=1, column=5, padx=(16, 2))
-        self.arch = ttk.Combobox(det, values=["amd64", "arm64"], width=7, state="readonly")
-        self.arch.grid(row=1, column=6)
-        self.arch.bind("<<ComboboxSelected>>", self.set_arch)
-
-    def reload_channels(self):
-        """界面列表 = 配置里的线 + 预设里还没加进来的线（灰显）。"""
-        cfg_ids = {c["id"] for c in self.cfg.get("channels", [])}
-        self.rows = [ch_mod.norm_channel(c) for c in self.cfg.get("channels", [])]
-        for c in ch_mod.all_presets():
-            c = ch_mod.norm_channel(c)
-            if c["id"] not in cfg_ids:
-                c["enabled"] = False
-                c["_preset"] = True
-                self.rows.append(c)
-        self.rows.sort(key=lambda c: (0 if c["source"] == "flighthub" else 1,
-                                      ch_mod.FH_ORDER.index(c["folder"])
-                                      if c["source"] == "flighthub"
-                                      and c.get("folder") in ch_mod.FH_ORDER else 99,
-                                      c.get("name", "")))
-        self.refresh_tree()
-
-    def refresh_tree(self):
-        sel = self.selected_id()
-        self.tree.delete(*self.tree.get_children())
-        for c in self.rows:
-            cs = (self.state.get("channels") or {}).get(c["id"], {})
-            rep = cs.get("last_report") or ""
-            self.tree.insert("", "end", iid=c["id"], tags=() if c["enabled"] else ("off",),
-                             values=("☑" if c["enabled"] else "☐", c.get("name", c["id"]),
-                                     "Flight Hub" if c["source"] == "flighthub" else "uupdump",
-                                     cs.get("last_version") or "—",
-                                     cs.get("last_check_date") or "—",
-                                     os.path.basename(rep)[:24] if rep else "—"))
-        if sel and self.tree.exists(sel):
-            self.tree.selection_set(sel)
-
-    def selected_id(self):
-        s = self.tree.selection()
-        return s[0] if s else ""
-
-    def row_by_id(self, cid):
-        return next((c for c in self.rows if c["id"] == cid), None)
-
-    def show_detail(self):
-        c = self.row_by_id(self.selected_id())
-        if not c:
-            self.detail.configure(text="选一行看看")
-            return
-        cs = (self.state.get("channels") or {}).get(c["id"], {})
-        ig = cs.get("ignored") or []
-        extra = f"\n来源参数：{'Flight Hub 目录 ' + c.get('folder','') if c['source']=='flighthub' else c.get('category','')}"
-        self.detail.configure(text=(
-            f"{c['name']}　（{'已启用' if c['enabled'] else '未启用'}）\n"
-            f"当前记录版本：{cs.get('last_version') or '未记录'}　"
-            f"上次检测：{cs.get('last_check_date') or '从未'}　"
-            f"连续失败：{cs.get('fail_count') or 0}{extra}\n"
-            f"忽略的版本：{('、'.join(ig) if ig else '无')}"))
-        self.arch.set(c.get("arch") or "amd64")
-
-    # ---- 更新线操作
-    def toggle_row(self, event=None):
-        cid = self.selected_id()
-        c = self.row_by_id(cid)
-        if c:
-            self.set_enabled(c, not c["enabled"])
-            self.refresh_tree()
-
-    def toggle_sel(self):
-        c = self.row_by_id(self.selected_id())
-        if c:
-            self.set_enabled(c, not c["enabled"])
-            self.refresh_tree()
-
-    def set_all(self, val):
-        for c in self.rows:
-            c["enabled"] = bool(val)
+    @_guard
+    def set_channel_enabled(self, id=None, enabled=False):
+        cid = str(id or "").strip()
+        val = _as_bool(enabled)
+        with self._lock:
+            c = self._find_row(cid)
+            if not c:
+                return {"ok": False, "error": "没找到这条更新线",
+                        "channels": self._channels_payload()}
+            c["enabled"] = val
             c.pop("_preset", None)
-        self.refresh_tree()
-        self.set_status(f"已{'全部启用' if val else '全部停用'}（记得保存）")
+            self._persist_channels()
+            name = c.get("name") or cid
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload,
+                "message": f"{name}：{'已启用' if val else '已停用'}"}
 
-    def set_enabled(self, c, val):
-        c["enabled"] = bool(val)
-        c.pop("_preset", None)
-        self.set_status(f"{c['name']}：{'启用' if val else '停用'}（记得保存）")
+    @_guard
+    def set_channels_enabled(self, enabled=False):
+        val = _as_bool(enabled)
+        with self._lock:
+            for c in self._rows:
+                c["enabled"] = val
+                c.pop("_preset", None)
+            self._persist_channels()
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload,
+                "message": "已全部启用" if val else "已全部停用"}
 
-    def set_arch(self, event=None):
-        c = self.row_by_id(self.selected_id())
-        if c:
-            c["arch"] = self.arch.get()
-            self.set_status(f"{c['name']} 架构改为 {c['arch']}（记得保存）")
+    @_guard
+    def set_channel_arch(self, id=None, arch="amd64"):
+        cid = str(id or "").strip()
+        want = str(arch or "").strip().lower()
+        if want not in ("amd64", "arm64"):
+            return {"ok": False, "error": "架构只能选 amd64（普通电脑）或 arm64（ARM 电脑）",
+                    "channels": self._channels_payload()}
+        with self._lock:
+            c = self._find_row(cid)
+            if not c:
+                return {"ok": False, "error": "没找到这条更新线",
+                        "channels": self._channels_payload()}
+            c["arch"] = want
+            c.pop("_preset", None)
+            self._persist_channels()
+            name = c.get("name") or cid
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload,
+                "message": f"{name} 的架构已改为 {want}"}
 
-    def add_custom(self):
-        raw = (self.custom.get() or "").strip()
-        if not raw:
-            return
-        if raw.startswith("http") or "category:" in raw:
-            import re
-            m = re.search(r"category:([a-z0-9\-]+)", raw)
-            cat = m.group(1) if m else None
-            if not cat:
-                messagebox.showinfo(APP_TITLE, "网址里要带 category:xxx，或者直接填分类名，"
-                                               "例如 w11-26h2")
-                return
-            new = ch_mod.uup_channel(cat)
-            new["url"] = raw
-        else:
-            new = ch_mod.uup_channel(raw)
-        new["enabled"] = True
-        exist = self.row_by_id(new["id"])
-        if exist:
-            exist["enabled"] = True
-            exist.pop("_preset", None)
-            self.refresh_tree()
-            self.tree.selection_set(new["id"])
-            self.show_detail()
-            self.set_status(f"{exist['name']} 本来就在列表里，已经帮你启用（记得保存）")
-            return
-        self.rows.append(new)
-        self.custom.set("")
-        self.refresh_tree()
-        self.tree.selection_set(new["id"])
-        self.show_detail()
-        self.set_status(f"已添加并启用 {new['name']}，点「保存设置」生效")
-
-    def discover(self):
-        cfg = self._apply()
-        if cfg is None:
-            return
-        self.cfg = cfg
-        import source
-        source.configure(cfg)
-        self.busy_run(source.flighthub, self._discover_done,
-                      msg="正在从 Flight Hub 抓频道列表（约 1-2 秒）…",
-                      widgets=(self.btn_discover,))
-
-    def _discover_done(self, data, err):
-        if err or not data:
-            self.set_status(f"抓取失败：{err or '没有解析到频道'}", "#c00")
-            return
-        added = []
-        known = {c["id"] for c in self.rows}
-        for folder, d in data.items():
-            cid = "fh:" + folder
-            note = f"{d['latest']['build']}（{d['latest'].get('date','')}）"
-            if cid in known:
-                continue
-            c = ch_mod.fh_channel(folder)
-            c["_preset"] = True
-            added.append((c, note))
-            self.rows.append(c)
-        self.rows.sort(key=lambda c: (0 if c["source"] == "flighthub" else 1, c.get("name", "")))
-        self.refresh_tree()
-        msg = f"Flight Hub 现有 {len(data)} 条 Insider 线" + (
-            f"，新发现 {len(added)} 条已加入列表" if added else "，没有新的")
-        self.set_status(msg + "。想盯哪条就双击启用，然后保存。")
-        for c, note in added[:8]:
-            self.detail.configure(text=f"新发现：{c['name']} 最新构建 {note}")
-
-    def check_selected(self):
-        cid = self.selected_id()
-        if not cid:
-            return
-        if not self.save(quiet=True):
-            return
-        self.run_check_live(["--only", cid], note=f"正在检测 {cid}")
-
-    def run_check_live(self, extra=None, note="正在检测"):
-        """跑一次检测，把过程实时显示在「状态与日志」页里，不弹控制台。"""
-        args = ["--force", "--verbose"] + list(extra or [])
-        cmd = check_cmd(args, console=False)
-        env = child_env({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
-        self._live_lines = []
-        if load_watch().get("online"):
-            note += "；注意哨兵正在运行"
-
-        def pump():
-            proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                                    errors="replace", env=env, creationflags=NO_WINDOW)
-            for line in proc.stdout:
-                self._live_lines.append(line.rstrip())
-            proc.wait()
-            return proc.returncode
-
-        self.nb.select(self.log_tab)
-        self.busy_run(pump, self._check_done, msg=f"{note}…（过程显示在日志里）",
-                      widgets=(self.btn_check,))
-        self.load_log()
-
-    def _check_done(self, rc, err):
-        if err:
-            self.set_status(f"检测出错：{err}", "#c00")
-        elif rc == 0:
-            self.set_status("检测完成。上面是这次的完整过程；有更新的话通知已经发出去了。")
-        else:
-            self.set_status(f"检测结束但退出码是 {rc}，看上面的日志找原因", "#c00")
-        self.refresh_status()
-
-    def open_selected_report(self):
-        c = self.row_by_id(self.selected_id())
-        if not c:
-            return
-        cs = (self.state.get("channels") or {}).get(c["id"], {})
-        rep = cs.get("last_report")
-        if rep and os.path.exists(rep):
-            spawn_view(rep)
-        else:
-            self.set_status("这条线还没有报告", "#c00")
-
-    def open_selected_dir(self):
-        c = self.row_by_id(self.selected_id())
-        if c:
-            os.startfile(reporter.chan_dir(self.cfg, c["id"]))      # noqa: S606
-
-    def _mutate_state(self, fn, ok_msg):
-        c = self.row_by_id(self.selected_id())
-        if not c:
-            return
-        cs = channel_state(self.state, c["id"])
-        fn(cs)
-        from config import save_state
-        save_state(self.state)
-        self.show_detail()
-        self.refresh_tree()
-        self.set_status(ok_msg)
-
-    def ignore_current(self):
-        c = self.row_by_id(self.selected_id())
-        cs = (self.state.get("channels") or {}).get(c["id"], {}) if c else {}
-        ver = cs.get("last_version")
-        if not ver:
-            self.set_status("这条线还没有记录版本，没法忽略", "#c00")
-            return
-
-        def fn(s):
-            s["ignored"] = sorted(set((s.get("ignored") or []) + [ver]))
-        self._mutate_state(fn, f"已忽略 {ver}：以后不再为这个版本生成报告")
-
-    def clear_ignored(self):
-        self._mutate_state(lambda s: s.update(ignored=[]), "已清除忽略列表")
-
-    # ======================================================== 检测与通知
-    def _entry(self, p, row, label, key, width=None, hint="", col=1, show=None):
-        ttk.Label(p, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        var = tk.StringVar(value=str(self.cfg.get(key, "")))
-        e = ttk.Entry(p, textvariable=var, width=width or 40, show=show or "")
-        e.grid(row=row, column=col, sticky="w", padx=6)
-        self.v[key] = var
-        if hint:
-            ttk.Label(p, text=hint, foreground="#888").grid(row=row, column=col + 1,
-                                                            sticky="w")
-        return e
-
-    def _check(self, p, row, label, key, hint=""):
-        var = tk.BooleanVar(value=bool(self.cfg.get(key, True)))
-        cb = ttk.Checkbutton(p, text=label, variable=var)
-        cb.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
-        self.v[key] = var
-        if hint:
-            ttk.Label(p, text=hint, foreground="#888").grid(row=row, column=2, sticky="w")
-        return cb
-
-    def _build_detect(self, p):
-        """「通知」页：什么时候提醒我、怎么提醒。"""
-        ttk.Label(p, text="这一页管两件事：多久查一次、以及它什么时候出声打扰你。",
-                  foreground="#4b5563", justify="left"
-                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-
-        self._entry(p, 1, "多久检查一次（分钟）", "watch_interval_minutes", 6)
-        ttk.Label(p, text="只问微软「官网变了没有」。没变化时对方只回一句「没变」，"
-                          "不下载任何东西、也不花 AI 的钱。\n"
-                          "所以 5 分钟一次几乎零成本。想更快就改小，最小 1 分钟。",
-                  foreground="#888", justify="left"
-                  ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 6))
-
-        ttk.Separator(p, orient="horizontal").grid(row=3, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        self._check(p, 4, "发现新版本时，弹一条通知告诉我", "notify")
-        self._check(p, 5, "一次发现好几条时，合并成一条通知", "merge_notifications")
-        self._entry(p, 6, "连续失败几次后提醒我", "notify_on_error_after", 6,
-                    "0 = 出错了也不提醒")
-        self._entry(p, 7, "这些时间段别打扰我", "quiet_hours", 16)
-        ttk.Label(p, text="填成 23:00-07:00 这种形式。这段时间里发现的新版本会先攒着，"
-                          "过了时段再补一条通知；留空就是不限。",
-                  foreground="#888", justify="left"
-                  ).grid(row=8, column=1, columnspan=2, sticky="w", pady=(0, 4))
-
-        ttk.Separator(p, orient="horizontal").grid(row=9, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        self._check(p, 10, "全屏看视频 / 玩游戏时，先别打扰我"
-                           "（不联网、不调 AI、不弹通知）",
-                    "game_mode_enabled")
-        self._entry(p, 11, "退出全屏后确认几秒才恢复", "game_exit_hold_seconds", 6,
-                    "防止切进切出时通知乱弹")
-        ttk.Label(p, text="怎么认出来的：有窗口铺满整块屏幕 + 没有标题栏 + 不是系统组件。"
-                          "无边框全屏的游戏正好符合。\n"
-                          "认错了就点下面「把当前程序加进忽略名单」，或者手动静默一会儿。",
-                  foreground="#888", justify="left"
-                  ).grid(row=12, column=1, columnspan=2, sticky="w", pady=(0, 4))
-        self.btn_quiet = ttk.Button(p, text="现在静默 2 小时（手动）",
-                                    command=self.quiet_now)
-        self.btn_quiet.grid(row=13, column=1, sticky="w", pady=(0, 2))
-        self.btn_ignore = ttk.Button(p, text="把当前正在用的程序加进忽略名单",
-                                     command=self.ignore_foreground)
-        self.btn_ignore.grid(row=13, column=2, sticky="w", padx=6, pady=(0, 2))
-        self.quiet_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
-        self.quiet_lbl.grid(row=14, column=1, columnspan=2, sticky="w", pady=(0, 6))
-
-        ttk.Separator(p, orient="horizontal").grid(row=15, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        ttk.Label(p, text="右下角托盘图标长什么样").grid(row=16, column=0, sticky="w",
-                                                        pady=3)
-        self.tray_style_var = tk.StringVar()
-        self.tray_combo = ttk.Combobox(p, textvariable=self.tray_style_var,
-                                       state="readonly", width=16)
-        self.tray_combo.grid(row=16, column=1, sticky="w", padx=6)
-        self.tray_combo.bind("<<ComboboxSelected>>", self.on_tray_style)
-        ttk.Label(p, text="换完立刻生效，不用重启", foreground="#888"
-                  ).grid(row=16, column=2, sticky="w")
-        self.tray_prev_lbl = ttk.Label(p, text="")
-        self.tray_prev_lbl.grid(row=17, column=1, sticky="w", pady=(4, 0))
-        self._tray_prev_img = None
-        self._tray_style_map = {}
-        self._build_tray_style_list()
-
-        ttk.Separator(p, orient="horizontal").grid(row=18, column=0, columnspan=3,
-                                                   sticky="ew", pady=8)
-        ttk.Label(p, text="中文报告写多详细").grid(row=19, column=0, sticky="w", pady=3)
-        self.detail_var = tk.StringVar(value=self.cfg.get("detail") or "标准")
-        ttk.Combobox(p, textvariable=self.detail_var, state="readonly", width=8,
-                     values=list(deepseek_api.DETAIL_SPEC.keys())
-                     ).grid(row=19, column=1, sticky="w", padx=6)
-        self._check(p, 20, "报告末尾附上官方原文全文", "include_official_text")
-        self._entry(p, 21, "每份报告最多保留几份", "keep_reports", 8)
-
-    # ---- 托盘图标样式
-    def _build_tray_style_list(self):
-        """列出所有托盘图标样式（读 icons/styles.json，由 做图标.py 生成）。"""
-        default_id, styles = tray_mod.load_styles()
-        labels = []
-        for s in styles:
-            label = s.get("name") or s.get("id")
-            self._tray_style_map[label] = s["id"]
-            labels.append(label)
-        self.tray_combo.configure(values=labels)
-        cur = (self.cfg.get("tray_style") or "").strip() or default_id
-        matched = False
-        for label, sid in self._tray_style_map.items():
-            if sid == cur:
-                self.tray_style_var.set(label)
-                matched = True
-                break
-        if not matched and labels:          # 老配置里的样式 id 已经不存在了
-            self.tray_style_var.set(labels[0])
-        self._update_tray_preview()
-
-    def _update_tray_preview(self):
-        sid = self._tray_style_map.get(self.tray_style_var.get(), "")
-        p = tray_mod.preview_path(sid) if sid else ""
-        try:
-            if p and os.path.exists(p):
-                self._tray_prev_img = tk.PhotoImage(file=p)     # 必须留住引用
-                self.tray_prev_lbl.configure(image=self._tray_prev_img, text="")
+    @_guard
+    def add_channel(self, text=None):
+        raw = str(text or "").strip()
+        with self._lock:
+            if not raw:
+                return {"ok": False,
+                        "error": "先填一个分类名或 uupdump 网址，例如 w11-26h2",
+                        "channels": self._channels_payload()}
+            if raw.lower().startswith("http") or "category:" in raw.lower():
+                m = re.search(r"category:([a-z0-9\-]+)", raw, re.I)
+                if not m:
+                    return {"ok": False,
+                            "error": "网址里要带 category:xxx，或者直接填分类名，例如 w11-26h2",
+                            "channels": self._channels_payload()}
+                new = ch_mod.uup_channel(m.group(1).lower())
+                new["url"] = raw
             else:
-                self.tray_prev_lbl.configure(image="", text="（没有预览图）")
-        except Exception as e:
-            self.tray_prev_lbl.configure(image="", text=f"预览显示失败：{e}")
+                new = ch_mod.uup_channel(raw.lower())
+            new = ch_mod.norm_channel(new)
+            new["enabled"] = True
+            exist = self._find_row(new["id"])
+            if exist:
+                exist["enabled"] = True
+                exist.pop("_preset", None)
+                self._persist_channels()
+                payload = self._channels_payload()
+                return {"ok": True, "channels": payload,
+                        "message": f"{exist['name']} 本来就在列表里，已经帮你启用"}
+            new.pop("_preset", None)
+            self._rows.append(new)
+            self._rows.sort(key=_row_sort_key)
+            self._persist_channels()
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload,
+                "message": f"已添加并启用 {new['name']}"}
 
-    def on_tray_style(self, event=None):
-        """换样式：存进配置，哨兵几秒内就会把托盘图标换掉。"""
-        sid = self._tray_style_map.get(self.tray_style_var.get(), "")
-        if not sid:
-            return
-        self.cfg["tray_style"] = sid
-        if not self.save(quiet=True):
-            return
-        self._update_tray_preview()
-        if load_watch().get("online"):
-            self.set_status(f"任务栏图标已换成「{self.tray_style_var.get()}」，"
-                            f"哨兵几秒内会换过来（看右下角托盘）。")
-        else:
-            self.set_status(f"任务栏图标已设为「{self.tray_style_var.get()}」。"
-                            f"后台哨兵没在跑，等它起来就是这个样式了。")
+    @_guard
+    def discover(self):
+        if not self._begin_long("正在从微软看板抓更新线…"):
+            return {"ok": False, "error": self._busy_error()}
 
+        def work():
+            import source
+            source.configure(dict(self._cfg))
+            data = source.flighthub()
+            with self._lock:
+                known = {c["id"] for c in self._rows}
+                added = 0
+                for folder in (data or {}):
+                    cid = "fh:" + folder
+                    if cid in known:
+                        continue
+                    c = ch_mod.norm_channel(ch_mod.fh_channel(folder))
+                    c["enabled"] = False
+                    c["_preset"] = True
+                    self._rows.append(c)
+                    added += 1
+                self._rows.sort(key=_row_sort_key)
+                payload = self._channels_payload()
+            return {"total_online": len(data or {}), "added": added,
+                    "channels": payload}
+
+        def done(res, err):
+            if err or not res:
+                self._push_event({"type": "done", "kind": "discover", "ok": False,
+                                  "text": f"抓取失败：{err or '没有解析到更新线'}"})
+                return
+            n, added = res["total_online"], res["added"]
+            text = (f"微软看板现有 {n} 条 Insider 线"
+                    + (f"，新发现 {added} 条" if added else "，没有新的"))
+            self._push_event({"type": "discover", "ok": True, "added": added,
+                              "total": n, "text": text,
+                              "channels": res["channels"]})
+            self._push_event({"type": "done", "kind": "discover", "ok": True,
+                              "text": text})
+
+        self._run_in_thread("抓取可选更新线", work, done)
+        return {"ok": True, "started": True}
+
+    @_guard
+    def ignore_version(self, id=None):
+        cid = str(id or "").strip()
+        with self._lock:
+            c = self._find_row(cid)
+            cs = ((self._state.get("channels") or {}).get(cid) or {})
+            ver = cs.get("last_version")
+            if not c:
+                return {"ok": False, "error": "没找到这条更新线",
+                        "channels": self._channels_payload()}
+            if not ver:
+                return {"ok": False, "error": "这条线还没有记录版本，没法忽略",
+                        "channels": self._channels_payload()}
+            cs = channel_state(self._state, cid)
+            cs["ignored"] = sorted(set([str(x) for x in (cs.get("ignored") or [])]
+                                       + [str(ver)]))
+            try:
+                save_state(self._state)
+            except Exception as e:
+                log_exception("保存忽略版本")
+                return {"ok": False, "error": f"记不进去：{e}",
+                        "channels": self._channels_payload()}
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload,
+                "message": f"已忽略 {ver}：以后不再为这个版本生成报告"}
+
+    @_guard
+    def clear_ignored(self, id=None):
+        cid = str(id or "").strip()
+        with self._lock:
+            c = self._find_row(cid)
+            if not c:
+                return {"ok": False, "error": "没找到这条更新线",
+                        "channels": self._channels_payload()}
+            cs = channel_state(self._state, cid)
+            cs["ignored"] = []
+            try:
+                save_state(self._state)
+            except Exception as e:
+                log_exception("清除忽略列表")
+                return {"ok": False, "error": f"记不进去：{e}",
+                        "channels": self._channels_payload()}
+            payload = self._channels_payload()
+        return {"ok": True, "channels": payload, "message": "已清除忽略列表"}
+
+    # ============================================================ 配置
+
+    @_guard
+    def save_config(self, partial=None):
+        """前端自动保存：只传改动过的键，后端做与旧版 _apply() 相同的清洗。"""
+        if not isinstance(partial, dict):
+            return {"ok": False, "error": "没有收到要保存的内容"}
+        with self._lock:
+            cfg = load_config()
+            err = self._merge_partial(cfg, partial)
+            if err:
+                return {"ok": False, "error": err}
+            self._merge_rows_from_cfg(cfg)
+            cfg = self._cfg_with_rows(cfg)
+            cfg["check_time"] = _normalize_check_time(cfg.get("check_time"))
+            cfg["game_ignore"] = [str(x).strip()
+                                  for x in (cfg.get("game_ignore") or [])
+                                  if str(x).strip()]
+            try:
+                save_config(cfg)
+            except Exception as e:
+                log_exception("保存设置")
+                return {"ok": False, "error": f"保存失败：{e}"}
+            self._cfg = cfg
+            self._state = load_state(force=True)
+            try:
+                online = bool(load_watch().get("online"))
+            except Exception:
+                online = False
+            # 「后台监控」被关掉时，顺手让正在跑的那个哨兵也退干净
+            if not cfg.get("watch_enabled", True) and online:
+                request_exit()
+        return {"ok": True, "config": cfg, "message": "已保存"}
+
+    def _merge_partial(self, cfg, partial):
+        """把前端传来的改动叠到 cfg 上；返回空串表示成功，否则返回人话错误。"""
+        for key, val in partial.items():
+            if key in ("channels", "schema") or key not in self._KNOWN_KEYS:
+                continue                      # 不认识的键直接忽略
+            label = self._LABELS.get(key, key)
+            if key in self._INT_KEYS:
+                try:
+                    if isinstance(val, bool):
+                        cfg[key] = int(val)
+                    elif isinstance(val, (int, float)):
+                        cfg[key] = int(val)
+                    else:
+                        s = str(val).strip()
+                        cfg[key] = int(s) if s else 0
+                except Exception:
+                    return f"「{label}」需要填整数，现在是「{val}」"
+            elif key in self._FLOAT_KEYS:
+                try:
+                    cfg[key] = float(str(val).strip())
+                except Exception:
+                    return f"「{label}」需要填数字，现在是「{val}」"
+            elif key in self._BOOL_KEYS:
+                cfg[key] = _as_bool(val)
+            elif key in self._STR_KEYS:
+                if key == "quiet_hours":
+                    qh = str(val or "").strip()
+                    if qh:
+                        norm = _normalize_quiet_hours(qh)
+                        if norm is None:
+                            return "静默时段格式应为 HH:MM-HH:MM，例如 23:00-07:00"
+                        cfg["quiet_hours"] = norm
+                    else:
+                        cfg["quiet_hours"] = ""
+                elif key == "detail":
+                    d = str(val or "").strip()
+                    if d not in DETAIL_OPTIONS:
+                        return "报告详细程度只能是：" + "、".join(DETAIL_OPTIONS)
+                    cfg["detail"] = d
+                elif key == "check_time":
+                    cfg["check_time"] = _normalize_check_time(val)
+                else:
+                    cfg[key] = str(val if val is not None else "").strip()
+            elif key == "game_ignore":
+                if isinstance(val, str):
+                    val = [val]
+                cfg["game_ignore"] = [str(x).strip() for x in (val or [])
+                                      if str(x).strip()]
+
+        # 数值范围（与旧版 _apply() 一致）
+        cfg["watch_interval_minutes"] = max(
+            1, min(1440, _as_int(cfg.get("watch_interval_minutes"), 5)))
+        cfg["game_exit_hold_seconds"] = max(
+            0, min(3600, _as_int(cfg.get("game_exit_hold_seconds"), 0)))
+        cfg["max_workers"] = max(1, min(16, _as_int(cfg.get("max_workers"), 4)))
+        cfg["tick_seconds"] = max(2, min(60, _as_int(cfg.get("tick_seconds"), 5)))
+        cfg["interval_days"] = max(1, _as_int(cfg.get("interval_days"), 1))
+        for k in ("keep_reports", "max_tokens", "request_timeout", "retries",
+                  "max_context_chars", "notify_on_error_after"):
+            if k == "notify_on_error_after":
+                cfg[k] = max(0, _as_int(cfg.get(k), 3))
+            else:
+                cfg[k] = max(0, _as_int(cfg.get(k), 0))
+        try:
+            cfg["temperature"] = float(cfg.get("temperature"))
+        except Exception:
+            return "「随机程度」需要填数字"
+        if cfg.get("detail") not in DETAIL_OPTIONS:
+            cfg["detail"] = "标准"
+        return ""
+
+    @_guard
     def quiet_now(self):
-        """手动静默：游戏识别不出来时兜底用（点一下 = 静默 2 小时，再点 = 取消）。"""
-        if not self.save(quiet=True):
-            return
-        cur = (self.cfg.get("silent_until") or "").strip()
+        with self._lock:
+            cfg = load_config()
+        cur = (cfg.get("silent_until") or "").strip()
         active = False
         if cur:
             try:
@@ -978,240 +939,336 @@ class App:
             except Exception:
                 active = False
         if active:
-            self.cfg["silent_until"] = ""
-            save_config(self.cfg)
-            self.set_status("已取消手动静默，哨兵马上恢复检测。")
+            cfg["silent_until"] = ""
+            msg = "已取消手动静默，后台监控马上恢复检测。"
         else:
             until = dt.datetime.now() + dt.timedelta(hours=2)
-            self.cfg["silent_until"] = until.isoformat(timespec="seconds")
-            save_config(self.cfg)
-            self.set_status(f"已静默到 {until:%H:%M}（哨兵最多 5 秒后生效），"
-                            f"到点自动恢复正常。")
-        self.refresh_status()
+            cfg["silent_until"] = until.isoformat(timespec="seconds")
+            msg = (f"已静默到 {until:%H:%M}（后台监控最多 5 秒后生效），"
+                   "到点自动恢复正常。")
+        cfg["game_ignore"] = [str(x).strip() for x in (cfg.get("game_ignore") or [])
+                              if str(x).strip()]
+        try:
+            save_config(cfg)
+        except Exception as e:
+            log_exception("保存手动静默")
+            return {"ok": False, "error": f"保存失败：{e}"}
+        with self._lock:
+            self._cfg = cfg
+        return {"ok": True, "config": cfg, "message": msg}
 
+    @_guard
     def ignore_foreground(self):
-        """误判兜底：把某个程序加进忽略名单，以后不再因为它进静默。"""
         try:
             import gamesense
             exe = gamesense.current_foreground()
         except Exception as e:
-            self.set_status(f"取不到当前前台程序：{e}", "#c00")
-            return
+            log_exception("读取当前前台程序")
+            return {"ok": False, "error": f"取不到当前前台程序：{e}"}
         if not exe:
-            self.set_status("取不到当前前台程序", "#c00")
-            return
+            return {"ok": False, "error": "取不到当前前台程序（先点一下你想忽略的那个窗口再来）"}
         name = os.path.basename(exe)
-        if not self.save(quiet=True):
-            return
-        lst = list(self.cfg.get("game_ignore") or [])
+        with self._lock:
+            cfg = load_config()
+        lst = list(cfg.get("game_ignore") or [])
         if name.lower() in [str(x).lower() for x in lst]:
-            self.set_status(f"{name} 已经在忽略名单里了")
-            return
+            return {"ok": True, "config": cfg,
+                    "message": f"{name} 已经在忽略名单里了"}
         lst.append(name)
-        self.cfg["game_ignore"] = lst
-        save_config(self.cfg)
-        self.set_status(f"已把 {name} 加进忽略名单，以后不会因为它进静默模式。")
-        self.refresh_status()
+        cfg["game_ignore"] = lst
+        try:
+            save_config(cfg)
+        except Exception as e:
+            log_exception("保存忽略名单")
+            return {"ok": False, "error": f"保存失败：{e}"}
+        with self._lock:
+            self._cfg = cfg
+        return {"ok": True, "config": cfg,
+                "message": f"已把 {name} 加进忽略名单，以后不会因为它进静默模式。"}
 
-    # ======================================================== API
-    def _build_api(self, p):
-        """「设置」页：AI 的 Key（必填）放最前面，专业参数一律收到下面去。"""
-        ttk.Label(p, text="必填的一项：让 AI 把微软的英文发布说明写成中文报告",
-                  foreground="#111827", font=("Microsoft YaHei", 11, "bold")
-                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+    @_guard
+    def set_tray_style(self, id=None):
+        sid = str(id or "").strip()
+        try:
+            default_id, styles = tray_mod.load_styles()
+        except Exception:
+            styles, default_id = [], "default"
+        known = {s.get("id") for s in styles} or {default_id}
+        if sid not in known:
+            return {"ok": False, "error": "没有这个托盘图标样式"}
+        label = next((s.get("name") or sid for s in styles if s.get("id") == sid), sid)
+        with self._lock:
+            cfg = load_config()
+            cfg["tray_style"] = sid
+            try:
+                save_config(cfg)
+            except Exception as e:
+                log_exception("保存托盘样式")
+                return {"ok": False, "error": f"保存失败：{e}"}
+            self._cfg = cfg
+        try:
+            online = bool(load_watch().get("online"))
+        except Exception:
+            online = False
+        msg = (f"任务栏图标已换成「{label}」，后台监控几秒内会换过来（看右下角托盘）。"
+               if online else
+               f"任务栏图标已设为「{label}」。后台监控没在跑，等它起来就是这个样式了。")
+        return {"ok": True, "message": msg}
 
-        e = self._entry(p, 1, "AI 的 Key", "api_key", 44, show="•")
-        self.show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(p, text="显示", variable=self.show_key,
-                        command=lambda: e.config(show="" if self.show_key.get() else "•")
-                        ).grid(row=1, column=3, sticky="w", padx=4)
-        ttk.Label(p, text="去哪拿：登录 platform.deepseek.com → 左侧「API keys」→ 新建一个，"
-                          "复制过来粘在上面。\n"
-                          "它只保存在你自己电脑上的 config.json 里，不会上传到任何地方。",
-                  foreground="#888", justify="left"
-                  ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(0, 8))
-        self.btn_apitest = ttk.Button(p, text="点这里测一下 Key 能不能用",
-                                      command=self.test_api)
-        self.btn_apitest.grid(row=3, column=1, sticky="w", pady=(0, 4))
+    # ============================================================ 检测 / 通知
 
-        ttk.Separator(p, orient="horizontal").grid(row=4, column=0, columnspan=4,
-                                                   sticky="ew", pady=10)
-        ttk.Label(p, text="—— 以下是高级选项，正常用不需要动 ——",
-                  foreground="#98a2b3").grid(row=5, column=0, columnspan=4,
-                                             sticky="w", pady=(0, 4))
-        self._entry(p, 6, "AI 服务地址", "api_base")
-        self._entry(p, 7, "模型名称", "model")
-        self._check(p, 8, "关闭思考模式", "disable_thinking")
-        self._entry(p, 9, "单次回答最多多少词", "max_tokens", 8)
-        self._entry(p, 10, "随机程度 temperature", "temperature", 8)
-        self._entry(p, 11, "网络超时（秒）", "request_timeout", 8)
-        self._entry(p, 12, "失败重试几次", "retries", 6)
-        self._entry(p, 13, "同时抓几条线", "max_workers", 6, "1 = 一条一条抓")
-        self._entry(p, 14, "代理（可选，一般留空）", "proxy", 30,
-                    "例如 http://127.0.0.1:7897")
-        self._entry(p, 15, "喂给 AI 的原文上限（字符）", "max_context_chars", 10)
-        self._check(p, 16, "自动收录微软看板上新出现的更新线（默认不启用）",
-                    "auto_discover_channels")
+    @_guard
+    def check_channel(self, id=None):
+        cid = str(id or "").strip()
+        with self._lock:
+            c = self._find_row(cid)
+            if not c:
+                return {"ok": False, "error": "没找到这条更新线"}
+            name = c.get("name") or cid
+            try:
+                online = bool(load_watch().get("online"))
+            except Exception:
+                online = False
+        note = f"正在检测 {name}"
+        if online:
+            note += "（后台监控也在跑，两边可能同时写状态）"
+        if not self._run_check_live(["--only", cid], note=note):
+            return {"ok": False, "error": self._busy_error()}
+        return {"ok": True, "started": True}
 
-    # ======================================================== 开机自启
-    def _build_task(self, p):
-        """「开机自启」页：让它在后台一直盯着。
-
-        两种办法，**不需要管理员权限的那个放第一位** —— 这才是普通人该走的路。
-        计划任务更稳（崩了自动重启），但要弹 UAC，所以算「办法二」。
-        """
-        ttk.Label(p, text="想让它在后台一直盯着（右下角一直有托盘图标），"
-                          "下面两种办法任选一种就行。",
-                  foreground="#4b5563", justify="left"
-                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
-
-        ttk.Label(p, text="办法一（推荐）：开机自动启动　·　不需要管理员权限",
-                  foreground="#111827", font=("Microsoft YaHei", 11, "bold")
-                  ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 2))
-        self.btn_startup = ttk.Button(p, text="一键设置开机自启", command=self.toggle_startup)
-        self.btn_startup.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 2))
-        ttk.Label(p, text="原理就是往「启动」文件夹里放个快捷方式，登录时自动把它跑起来。"
-                          "不用管理员权限，不会弹窗。",
-                  foreground="#888", justify="left"
-                  ).grid(row=3, column=0, columnspan=4, sticky="w")
-        self.startup_lbl = ttk.Label(p, text="", foreground="#333")
-        self.startup_lbl.grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 10))
-
-        ttk.Label(p, text="办法二：装成 Windows 计划任务　·　更稳，但会弹一次 UAC",
-                  foreground="#111827", font=("Microsoft YaHei", 11, "bold")
-                  ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 2))
-        self.btn_task_install = ttk.Button(p, text="安装 / 更新计划任务",
-                                           command=self.install_task)
-        self.btn_task_install.grid(row=6, column=0, sticky="w")
-        self.btn_task_remove = ttk.Button(p, text="删除计划任务",
-                                          command=self.remove_task)
-        self.btn_task_remove.grid(row=6, column=1, sticky="w", padx=6)
-        ttk.Label(p, text="（点的时候会弹一次 UAC，点「是」就行）",
-                  foreground="#888").grid(row=6, column=2, columnspan=2, sticky="w")
-        ttk.Label(p, text="好处是它「不限时 + 崩了自动重启」，不会被系统定时杀掉，"
-                          "比办法一更不容易断。",
-                  foreground="#888", justify="left"
-                  ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        self.task_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
-        self.task_lbl.grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 6))
-        self.logon_lbl = ttk.Label(p, text="", foreground="#333", justify="left")
-        self.logon_lbl.grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 6))
-
-        ttk.Button(p, text="现在就跑起来（不等下次开机）", command=self.start_watch
-                   ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-        ttk.Separator(p, orient="horizontal").grid(row=11, column=0, columnspan=4,
-                                                   sticky="ew", pady=8)
-        ttk.Label(p, text="—— 以下是给排查用的，正常用不到 ——",
-                  foreground="#98a2b3").grid(row=12, column=0, columnspan=4,
-                                             sticky="w", pady=(0, 4))
-        ttk.Button(p, text="刷新后台状态", command=self.refresh_logon_hint
-                   ).grid(row=13, column=0, sticky="w", pady=4)
-        ttk.Button(p, text="注册通知 / 协议", command=self.reg
-                   ).grid(row=13, column=1, sticky="w", pady=4)
-        ttk.Button(p, text="在桌面放快捷方式",
-                   command=lambda: self.make_shortcut("desktop")
-                   ).grid(row=13, column=2, sticky="w", pady=4)
-        ttk.Button(p, text="放进开始菜单",
-                   command=lambda: self.make_shortcut("startmenu")
-                   ).grid(row=13, column=3, sticky="w", pady=4)
-        _exe, _args = watch_target()
-        ttk.Label(p, text="程序目录：" + BASE_DIR, foreground="#98a2b3"
-                  ).grid(row=14, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(p, text="运行方式：" + _exe + " " + _args, foreground="#98a2b3"
-                  ).grid(row=15, column=0, columnspan=4, sticky="w")
-        ttk.Label(p, text="任务名：" + TASK_NAME, foreground="#98a2b3"
-                  ).grid(row=16, column=0, columnspan=4, sticky="w")
-        self.refresh_logon_hint()
-
-    # ---- 哨兵状态
-    def refresh_logon_hint(self):
-        """在「计划任务」页显示哨兵现在是死是活。"""
+    @_guard
+    def check_now(self):
         try:
             w = load_watch()
-            if w.get("online"):
-                mode = {"game": "你正在玩游戏，它先不打扰你", "paused": "已暂停（没启用）"
-                        }.get(w.get("mode"), "正常")
-                txt = (f"后台现在：正在运行　（{mode}）\n"
-                       f"上次问微软：{w.get('last_check') or '还没问过'}"
-                       f"　　上次发现新版本：{w.get('last_change') or '还没有过'}"
-                       f"　　累计检查 {w.get('checks')} 次")
-                txt += ("\n托盘图标：已经在右下角了"
-                        if w.get("tray") else
-                        "\n托盘图标：没挂上（不影响检测，原因写在下面的日志里）")
-                if w.get("tray"):
-                    txt += ("（看不到就先点任务栏那个 ∧ 展开；"
-                            "想让它一直显示：设置 → 个性化 → 任务栏 → "
-                            "其他系统托盘图标 → 把 win升级报告 打开）")
-                if w.get("game_exe"):
-                    txt += f"\n现在因为检测到全屏程序而安静：{w.get('game_exe')}"
-                if w.get("manual_until"):
-                    txt += f"\n手动静默到：{w.get('manual_until')}"
-                if w.get("last_result"):
-                    txt += f"\n最近一次结果：{w.get('last_result')}"
+        except Exception:
+            w = {"online": False}
+        if w.get("online"):
+            request_check_now()
+            if w.get("mode") == "game":
+                msg = "后台正在全屏静默中，请求已记下；游戏一关就立刻检测。"
             else:
-                txt = ("后台现在：没有在运行。\n"
-                       "· 点上面「现在就跑起来」立刻起来，不用等下次开机\n"
-                       "· 想让它以后开机自己起：走上面的「办法一」最省事（不用管理员权限）")
-            self.logon_lbl.configure(text=txt)
+                msg = "已通知后台立刻检测（最多 5 秒后开始），结果和通知都由它来出。"
+            return {"ok": True, "started": True, "message": msg}
+        if not self._run_check_live(["--force"], note="正在检测"):
+            return {"ok": False, "started": False, "error": self._busy_error()}
+        return {"ok": True, "started": True,
+                "message": "后台监控没在运行，已经在后台单独跑了一次检测，"
+                           "过程显示在「日志与诊断」里。"}
+
+    @_guard
+    def toggle_watch(self):
+        with self._lock:
+            cfg = load_config()
+        try:
+            online = bool(load_watch().get("online"))
+        except Exception:
+            online = False
+        if online:
             try:
-                on = os.path.exists(startup_link())
-                self.btn_startup.configure(
-                    text="取消开机自启" if on else "一键设置开机自启")
-                self.startup_lbl.configure(
-                    text=("开机自启：已开启　→ 以后每次登录都会自动跑起来"
-                          if on else "开机自启：未开启"))
+                selfcheck.stop_sentinel()
             except Exception:
-                pass
-        except Exception:
-            pass
-
-    # ======================================================== 日志
-    def _build_log(self, p):
-        ttk.Label(p, text="平时不用看这一页。它没动静、或者你想确认它到底查了没有，再来这里。",
-                  foreground="#4b5563", justify="left").pack(anchor="w", pady=(0, 6))
-        top = ttk.Frame(p)
-        top.pack(fill="x")
-        ttk.Button(top, text="刷新", command=self.refresh_status).pack(side="left")
-        ttk.Button(top, text="打开日志文件",
-                   command=lambda: os.startfile(LOG_PATH if os.path.exists(LOG_PATH)
-                                                else LOG_DIR)).pack(side="left", padx=6)
-        ttk.Button(top, text="清空日志", command=self.clear_log).pack(side="left")
-        ttk.Button(top, text="打开总览页", command=self.open_index).pack(side="left", padx=6)
-        self.summary_lbl = ttk.Label(p, text="", justify="left")
-        self.summary_lbl.pack(anchor="w", pady=(8, 6))
-        self.logbox = tk.Text(p, height=20, wrap="none", font=("Consolas", 9))
-        sb = ttk.Scrollbar(p, orient="vertical", command=self.logbox.yview)
-        self.logbox.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.logbox.pack(fill="both", expand=True)
-        self.logbox.configure(state="disabled")
-
-    def load_log(self):
+                log_exception("停止后台监控")
+            self._refresh_cfg()
+            return {"ok": True, "online": False,
+                    "message": "已停止后台监控，托盘图标几秒内消失。"}
+        if not resolve_api_key(cfg):
+            return {"ok": False, "online": False,
+                    "error": "先去「设置」页填一个 AI 的 Key —— 不填的话就算发现新版本也写不出中文报告。"}
         try:
-            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                txt = f.read()[-60_000:]
-        except Exception:
-            txt = "(还没有日志)"
-        self.logbox.configure(state="normal")
-        self.logbox.delete("1.0", "end")
-        self.logbox.insert("1.0", txt)
-        self.logbox.see("end")
-        self.logbox.configure(state="disabled")
-
-    def clear_log(self):
-        try:
-            open(LOG_PATH, "w", encoding="utf-8").close()
+            ok, msg = selfcheck.start_sentinel()
         except Exception as e:
-            self.set_status(f"清空失败：{e}", "#c00")
-        self.load_log()
+            log_exception("启动后台监控")
+            return {"ok": False, "online": False, "error": f"启动失败：{e}"}
+        if not ok:
+            return {"ok": False, "online": False, "error": msg}
+        self._refresh_cfg()
+        return {"ok": True, "online": True,
+                "message": "已经启动，几秒后右下角会出现托盘图标。"
+                           "（要是没看到，点任务栏那个 ∧ 展开一下）"}
 
+    @_guard
+    def test_toast(self):
+        def work():
+            notify.register_app(self._cfg.get("app_id") or "WinUpdReport.App")
+            return notify.show("win升级报告 · 测试通知",
+                               "看到这条说明通知通道正常，点一下试试能不能打开总览页。",
+                               arg1="index")
+
+        def done(res, err):
+            ok = bool(res and res[0])
+            if ok:
+                text = "测试通知已发送（点它试试能不能打开总览页）"
+            else:
+                detail = err or (res[1] if res and len(res) > 1 else "未知原因")
+                text = f"发送失败：{detail}"
+            self._push_event({"type": "done", "kind": "toast", "ok": ok, "text": text})
+
+        if not self._begin_long("正在发一条测试通知…"):
+            return {"ok": False, "error": self._busy_error()}
+        self._run_in_thread("发测试通知", work, done)
+        return {"ok": True, "started": True}
+
+    @_guard
+    def test_api(self):
+        with self._lock:
+            cfg = dict(self._cfg)
+        key = resolve_api_key(cfg)
+        if not key:
+            return {"ok": False, "error": "还没填 AI 的 Key：先在「设置」页粘贴一个再试"}
+
+        def work():
+            return deepseek_api.summarize(cfg, key, "只回复两个字：正常", timeout=60)
+
+        def done(out, err):
+            if err:
+                self._push_event({"type": "done", "kind": "api_test", "ok": False,
+                                  "text": f"AI 测试没通过：{err}"})
+                return
+            model = cfg.get("model") or "AI"
+            reply = (out or "").strip()[:30]
+            self._push_event({"type": "done", "kind": "api_test", "ok": True,
+                              "text": f"AI 可用：模型 {model} 回复「{reply}」"})
+
+        if not self._begin_long(f"正在测试 AI 的 Key（{mask_key(key)}）…"):
+            return {"ok": False, "error": self._busy_error()}
+        self._run_in_thread("测试 AI 的 Key", work, done)
+        return {"ok": True, "started": True}
+
+    # ============================================================ 自启 / 诊断
+
+    @_guard
+    def run_selfcheck(self):
+        def work():
+            return selfcheck.check_all(fix=True)
+
+        def done(res, err):
+            if err or not res:
+                text = f"体检失败：{err or '没有结果'}"
+                self._push_event({"type": "done", "kind": "selfcheck", "ok": False,
+                                  "text": text})
+                return
+            head = selfcheck.summary(res)
+            items = [{"name": str(r.get("name") or ""),
+                      "status": str(r.get("status") or ""),
+                      "msg": str(r.get("msg") or "")} for r in res]
+            self._push_event({"type": "selfcheck", "ok": True, "summary": head,
+                              "items": items})
+            self._push_event({"type": "done", "kind": "selfcheck", "ok": True,
+                              "text": "体检完成：" + head})
+            self._refresh_cfg()
+
+        if not self._begin_long("正在体检并自动修复…"):
+            return {"ok": False, "error": self._busy_error()}
+        self._run_in_thread("体检并自动修复", work, done)
+        return {"ok": True, "started": True}
+
+    @_guard
+    def install_task(self):
+        with self._lock:
+            cfg = dict(self._cfg)
+
+        def work():
+            notify.register_app(cfg.get("app_id") or "WinUpdReport.App")
+            res = ps_task_elevated("install", mode="watch",
+                                   also_remove=DAILY_TASK_NAME)
+            return res, self._query_task_info_text()
+
+        def done(res, err):
+            task_text = ""
+            if err or not res:
+                ok, text = False, f"安装出错：{err or '没有结果'}"
+            else:
+                (installed, msg), task_text = res
+                ok = bool(installed)
+                msg = msg or ""
+                if ok:
+                    text = ("计划任务已装好：登录时自动启动，每隔几分钟看一次官方看板，"
+                            "不限时、崩了会自动重启（旧的每日任务已卸掉）。")
+                elif "取消" in msg or "canceled" in msg.lower() or "cancelled" in msg.lower():
+                    text = "UAC 被取消。可以改用「一键设置开机自启」这个免管理员方案。"
+                else:
+                    text = "安装失败：" + (msg[:260] or "未知原因")
+            if task_text:
+                with self._lock:
+                    self._task_text = task_text
+                self._push_event({"type": "task_info", "text": task_text})
+            self._push_event({"type": "done", "kind": "task_install", "ok": ok,
+                              "text": text})
+
+        if not self._begin_long("正在申请管理员权限（会弹 UAC，点「是」继续）…"):
+            return {"ok": False, "error": self._busy_error()}
+        self._run_in_thread("安装计划任务", work, done)
+        return {"ok": True, "started": True}
+
+    @_guard
+    def remove_task(self):
+        def work():
+            res = ps_task_elevated("remove", mode="watch",
+                                   also_remove=DAILY_TASK_NAME)
+            return res, self._query_task_info_text()
+
+        def done(res, err):
+            task_text = ""
+            if err or not res:
+                ok, text = False, f"删除出错：{err or '没有结果'}"
+            else:
+                (removed, msg), task_text = res
+                ok = bool(removed)
+                text = "计划任务已删除" if ok else "删除失败：" + (msg or "未知原因")[:200]
+            if task_text:
+                with self._lock:
+                    self._task_text = task_text
+                self._push_event({"type": "task_info", "text": task_text})
+            self._push_event({"type": "done", "kind": "task_remove", "ok": ok,
+                              "text": text})
+
+        if not self._begin_long("正在申请管理员权限删除计划任务…"):
+            return {"ok": False, "error": self._busy_error()}
+        self._run_in_thread("删除计划任务", work, done)
+        return {"ok": True, "started": True}
+
+    @_guard
+    def toggle_startup(self):
+        def work():
+            # 模块级同名 helper（见文件前半部分）
+            return toggle_startup()
+
+        def done(res, err):
+            if err or not res:
+                ok, text = False, f"设置开机自启出错：{err or '没有结果'}"
+            else:
+                ok, msg = res
+                text = msg or ("已设置登录自启" if ok else "设置失败")
+            self._push_event({"type": "done", "kind": "startup", "ok": bool(ok),
+                              "text": text})
+
+        if not self._begin_long("正在设置登录自启…"):
+            return {"ok": False, "error": self._busy_error()}
+        self._run_in_thread("设置登录自启", work, done)
+        return {"ok": True, "started": True}
+
+    @_guard
+    def register_app(self):
+        app_id = self._cfg.get("app_id") or "WinUpdReport.App"
+        try:
+            ok = notify.register_app(app_id)
+        except Exception as e:
+            log_exception("注册通知 / 协议")
+            return {"ok": False, "error": f"注册失败：{e}"}
+        if ok:
+            return {"ok": True,
+                    "message": "已写入注册表：通知来源和 winupdrept: 协议都注册好了"}
+        return {"ok": False, "error": "注册表写入失败，可能是权限问题"}
+
+    @_guard
     def make_shortcut(self, where="desktop"):
-        """在桌面 / 开始菜单放一个快捷方式，直接打开这个程序。"""
+        wh = str(where or "desktop").strip().lower()
+        if wh not in ("desktop", "startmenu"):
+            wh = "desktop"
         exe = sys.executable if FROZEN else pythonw()
-        targ = "" if FROZEN else f'"{CHECKER}" gui'
+        targ = "" if FROZEN else f'"{os.path.join(BASE_DIR, "app.py")}"'
         name = "win升级报告.lnk"
-        if where == "desktop":
+        if wh == "desktop":
             folder = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
         else:
             folder = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
@@ -1226,409 +1283,975 @@ class App:
                 f"$s.IconLocation = '{resource_path('icon.ico')}'\n"
                 "$s.Description = 'win升级报告：监控 Windows 更新线'\n"
                 "$s.Save()\n")
-        with open(ps1, "w", encoding="utf-8-sig") as f:
-            f.write(body)
-        ps_run(["-File", ps1], timeout=60)
-        if os.path.exists(link):
-            self.set_status(f"快捷方式已创建：{link}")
-        else:
-            self.set_status("快捷方式创建失败，看日志", "#c00")
-
-    def open_app_folder(self):
-        os.startfile(os.path.dirname(os.path.abspath(sys.executable))
-                     if FROZEN else BASE_DIR)                    # noqa: S606
-
-    def open_index(self):
-        spawn_view("index")
-
-    # ======================================================== 通用动作
-    def _apply(self):
-        cfg = dict(self.cfg)
-        for k, var in self.v.items():
-            val = var.get()
-            if isinstance(var, tk.BooleanVar):
-                cfg[k] = bool(val)
-            elif k in ("max_tokens", "request_timeout", "retries", "max_workers",
-                       "max_context_chars", "interval_days", "keep_reports",
-                       "notify_on_error_after", "watch_interval_minutes",
-                       "game_exit_hold_seconds", "tick_seconds"):
-                try:
-                    cfg[k] = int(str(val).strip() or 0)
-                except ValueError:
-                    messagebox.showerror(APP_TITLE, f"{k} 需要是整数：{val}")
-                    return None
-            elif k == "temperature":
-                try:
-                    cfg[k] = float(str(val).strip())
-                except ValueError:
-                    messagebox.showerror(APP_TITLE, f"temperature 需要是数字：{val}")
-                    return None
-            else:
-                cfg[k] = str(val).strip()
-        cfg["detail"] = self.detail_var.get()
-        cfg["schema"] = 3
-
-        # 旧版的「每天检测时间」现在只留给手动 --check 用，界面上不再暴露。
-        # 这里顺手把格式收拾干净；万一存的是坏值就退回默认，不能因为它挡住保存。
-        t = (cfg.get("check_time") or "").strip()
         try:
-            hh, mm = t.split(":")
-            dt.time(int(hh), int(mm))
-            cfg["check_time"] = f"{int(hh):02d}:{int(mm):02d}"
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(ps1, "w", encoding="utf-8-sig") as f:
+                f.write(body)
+            ps_run(["-File", ps1], timeout=60)
+        except Exception as e:
+            log_exception("创建快捷方式")
+            return {"ok": False, "error": f"创建快捷方式失败：{e}"}
+        if os.path.exists(link):
+            return {"ok": True, "message": f"快捷方式已创建：{link}"}
+        return {"ok": False, "error": "快捷方式没创建出来，过一会儿再试一次"}
+
+    @_guard
+    def refresh_task_info(self):
+        self._query_task_info_async()
+        return {"ok": True, "started": True}
+
+    # ============================================================ 日志
+
+    @_guard
+    def read_log(self):
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                txt = f.read()[-60_000:]
         except Exception:
-            cfg["check_time"] = "12:00"
-        qh = (cfg.get("quiet_hours") or "").strip()
-        if qh:
+            txt = "(还没有日志)"
+        return {"ok": True, "text": txt, "path": LOG_PATH}
+
+    @_guard
+    def clear_log(self):
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(LOG_PATH, "w", encoding="utf-8"):
+                pass
+        except Exception as e:
+            return {"ok": False, "error": f"清空失败：{e}"}
+        return {"ok": True, "message": "日志已清空"}
+
+    # ============================================================ 报告
+
+    @_guard
+    def reports(self):
+        with self._lock:
+            self._state = load_state(force=True)
+            items = self._collect_reports()
+        return {"ok": True, "reports": items}
+
+    @_guard
+    def report_html(self, file=None):
+        path = self._resolve_report_path(file)
+        if not path:
+            return {"ok": False, "error": "找不到这份报告，可能已经被删掉了"}
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext in (".md", ".markdown", ".txt"):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    md = f.read()
+                title = os.path.splitext(os.path.basename(path))[0]
+                # render_page 内部会用 str.format，标题里的大括号要转义
+                safe_title = title.replace("{", "{{").replace("}", "}}")
+                html = mdlite.render_page(md, safe_title)
+            else:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    html = f.read()
+                title = _html_title(html) or os.path.splitext(
+                    os.path.basename(path))[0]
+        except Exception as e:
+            log_exception("读取报告")
+            return {"ok": False, "error": f"读不出这份报告：{e}"}
+        return {"ok": True, "html": _inject_report_css(html), "title": title}
+
+    # ============================================================ 外部打开 / 窗口
+
+    @_guard
+    def open_external(self, kind="", path=""):
+        k = str(kind or "").strip().lower()
+        p = str(path or "").strip()
+        cfg = self._cfg
+        report_dir = cfg.get("report_dir") or REPORT_DIR
+        try:
+            if k in ("browser", "url", "link"):
+                return self._open_in_browser(p)
+            if k == "overview":
+                spawn_view("index")
+                return {"ok": True, "message": "已在浏览器里打开总览页"}
+            if k == "log":
+                target = LOG_PATH if os.path.exists(LOG_PATH) else LOG_DIR
+                os.startfile(target)                                   # noqa: S606
+                return {"ok": True, "message": "已打开日志文件"}
+            if k == "report_folder":
+                self._ensure_dir(report_dir)
+                os.startfile(report_dir)                               # noqa: S606
+                return {"ok": True, "message": "已打开报告文件夹"}
+            if k == "app_folder":
+                d = (os.path.dirname(os.path.abspath(sys.executable))
+                     if FROZEN else BASE_DIR)
+                os.startfile(d)                                        # noqa: S606
+                return {"ok": True, "message": "已打开程序文件夹"}
+            if k == "folder":
+                return self._open_folder(p or report_dir, report_dir)
+            return {"ok": False, "error": f"不认识这个打开方式：{kind}"}
+        except Exception as e:
+            log_exception("打开外部程序")
+            return {"ok": False, "error": f"打不开：{type(e).__name__}: {e}"}
+
+    @_guard
+    def window_minimize(self):
+        win = self._window
+        if win is None:
+            return {"ok": False, "error": "窗口还没准备好，稍等一下"}
+        try:
+            win.minimize()
+        except Exception as e:
+            log_exception("最小化窗口")
+            return {"ok": False, "error": f"最小化失败了：{e}"}
+        return {"ok": True}
+
+    @_guard
+    def window_toggle_max(self):
+        """自绘最大化：不用 pywebview 的 maximize()（无边框 WinForms 最大化会盖住任务栏）。"""
+        u, _dwm = _win32()
+        hwnd = self._hwnd()
+        if not hwnd:
+            return {"ok": False, "error": "窗口还没准备好，稍等一下",
+                    "maximized": bool(self._maximized)}
+        with self._max_lock:
             try:
-                a, b = qh.split("-")
-                dt.time(*[int(x) for x in a.strip().split(":")])
-                dt.time(*[int(x) for x in b.strip().split(":")])
-                cfg["quiet_hours"] = f"{a.strip()}-{b.strip()}"
+                if u.IsIconic(ctypes.c_void_p(hwnd)):
+                    u.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)   # 从任务栏还原
+                if self._maximized:
+                    rect = self._normal_rect
+                    if rect:
+                        u.SetWindowPos(ctypes.c_void_p(hwnd), None,
+                                       int(rect[0]), int(rect[1]),
+                                       int(rect[2]), int(rect[3]),
+                                       SWP_NOZORDER | SWP_NOACTIVATE)
+                    self._apply_corner(DWMWCP_ROUND)
+                    self._maximized = False
+                else:
+                    rc = _WinRect()
+                    u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rc))
+                    normal = (rc.left, rc.top, rc.right - rc.left,
+                              rc.bottom - rc.top)
+                    mon = u.MonitorFromWindow(ctypes.c_void_p(hwnd),
+                                              MONITOR_DEFAULTTONEAREST)
+                    mi = _MonitorInfo()
+                    mi.cbSize = ctypes.sizeof(_MonitorInfo)
+                    if not u.GetMonitorInfoW(ctypes.c_void_p(mon),
+                                             ctypes.byref(mi)):
+                        return {"ok": False, "maximized": False,
+                                "error": "算不出屏幕可用区域，先别最大化"}
+                    work = mi.rcWork
+                    u.SetWindowPos(ctypes.c_void_p(hwnd), None,
+                                   int(work.left), int(work.top),
+                                   int(work.right - work.left),
+                                   int(work.bottom - work.top),
+                                   SWP_NOZORDER | SWP_NOACTIVATE)
+                    self._apply_corner(DWMWCP_DONOTROUND)
+                    self._normal_rect = normal
+                    self._maximized = True
+                return {"ok": True, "maximized": bool(self._maximized)}
+            except Exception as e:
+                log_exception("切换最大化")
+                return {"ok": False, "maximized": bool(self._maximized),
+                        "error": f"切换最大化失败了：{e}"}
+
+    @_guard
+    def begin_resize(self, edge="e"):
+        """开始八向缩放：立即返回，后台线程跟着鼠标完成（前端 8 个透明抓手）。"""
+        want = str(edge or "").strip().lower()
+        if want not in ("n", "s", "e", "w", "ne", "nw", "se", "sw"):
+            return {"ok": False, "error": "不认识的缩放方向"}
+        ok, err = self._start_resize(want)
+        if not ok:
+            return {"ok": False, "error": err}
+        return {"ok": True}
+
+    @_guard
+    def window_close(self):
+        """只关窗口：后台哨兵是独立进程，照旧跑。"""
+        self._schedule_destroy()
+        return {"ok": True}
+
+    @_guard
+    def close_window(self):
+        """旧名字，保留转给 window_close()。"""
+        return self.window_close()
+
+    @_guard
+    def quit_all(self):
+        try:
+            selfcheck.stop_sentinel()
+        except Exception:
+            log_exception("完全退出时停止后台监控")
+        self._schedule_destroy()
+        return {"ok": True}
+
+    # ======================================================== 内部实现（不暴露给 JS）
+
+    def _hwnd(self):
+        """懒获取窗口句柄：优先 window.native.Handle，失败就用标题兜底。"""
+        with self._lock:
+            cached = self._hwnd_cache
+        if cached:
+            try:
+                u, _d = _win32()
+                if u.IsWindow(ctypes.c_void_p(cached)):
+                    return cached
             except Exception:
-                messagebox.showerror(APP_TITLE, "静默时段格式应为 HH:MM-HH:MM，例如 23:00-07:00")
-                return None
-        cfg["interval_days"] = max(1, int(cfg.get("interval_days") or 1))
-        cfg["max_workers"] = max(1, min(16, int(cfg.get("max_workers") or 4)))
-        # 哨兵的节奏：太小会给微软服务器添麻烦，太大又失去「马上知道」的意义
-        cfg["watch_interval_minutes"] = max(
-            1, min(1440, int(cfg.get("watch_interval_minutes") or 5)))
-        cfg["game_exit_hold_seconds"] = max(
-            0, min(3600, int(cfg.get("game_exit_hold_seconds") or 60)))
-        cfg["tick_seconds"] = max(2, min(60, int(cfg.get("tick_seconds") or 5)))
-        cfg["game_ignore"] = [str(x).strip() for x in (cfg.get("game_ignore") or [])
-                              if str(x).strip()]
+                pass
+        hwnd = 0
+        win = self._window
+        if win is not None:
+            try:
+                native = getattr(win, "native", None)
+                if native is not None:
+                    hwnd = int(native.Handle.ToInt32())
+            except Exception:
+                hwnd = 0
+        if not hwnd:
+            try:
+                u, _d = _win32()
+                h = int(u.FindWindowW(None, APP_TITLE))
+                # 只认自己进程的窗口：别的地方也可能有个同名窗口（比如预览工具）
+                if h:
+                    pid = wt.DWORD(0)
+                    u.GetWindowThreadProcessId(ctypes.c_void_p(h),
+                                               ctypes.byref(pid))
+                    if pid.value == os.getpid():
+                        hwnd = h
+            except Exception:
+                hwnd = 0
+        with self._lock:
+            self._hwnd_cache = hwnd
+        return hwnd
 
-        # 只保留：启用的线 + 本来就配置过的线
-        was = {c["id"] for c in self.cfg.get("channels", [])}
-        keep = [{"id": c["id"], "source": c["source"], "name": c.get("name"),
-                 "enabled": bool(c["enabled"]), "arch": c.get("arch") or "amd64"}
-                | ({"folder": c["folder"]} if c["source"] == "flighthub"
-                   else {"category": c["category"], "url": c.get("url")})
-                for c in self.rows if c["enabled"] or c["id"] in was]
-        cfg["channels"] = [ch_mod.norm_channel(c) for c in keep]
-        self.cfg = cfg
-        return cfg
-
-    def save(self, quiet=False):
-        cfg = self._apply()
-        if cfg is None:
+    def _apply_corner(self, preference):
+        """Win11 圆角（Win10 会失败，失败忽略即可）。"""
+        hwnd = self._hwnd()
+        if not hwnd:
             return False
-        save_config(cfg)
-        # 「开启后台监控」这个开关被关掉时，顺手让正在跑的那个哨兵也退干净
-        # （否则它会一直待在托盘里，用户会以为关不掉）
-        if not cfg.get("watch_enabled", True) and load_watch().get("online"):
-            request_exit()
-        self.reload_channels()
-        if not quiet:
-            n = sum(1 for c in self.rows if c["enabled"])
-            has_task = ("哨兵任务" in (self._task_text or "")
-                        and "未安装" not in (self._task_text or ""))
-            self.set_status(f"已保存：监控 {n} 条更新线。"
-                            + ("哨兵会马上重读设置，间隔、游戏静默这些改动立刻生效，"
-                               "不用重装计划任务。"
-                               if has_task else
-                               "还没装计划任务，去「计划任务」页装一个。"))
-        self.refresh_status()
+        try:
+            _u, dwm = _win32()
+            pref = ctypes.c_int(int(preference))
+            hr = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd),
+                                           DWMWA_WINDOW_CORNER_PREFERENCE,
+                                           ctypes.byref(pref),
+                                           ctypes.sizeof(pref))
+            return hr == 0
+        except Exception:
+            return False
+
+    def _start_resize(self, edge):
+        """后台跟踪鼠标完成缩放。返回 (是否已开始, 错误文案)。"""
+        u, _d = _win32()
+        hwnd = self._hwnd()
+        if not hwnd:
+            return False, "窗口还没准备好，稍等一下"
+        with self._lock:
+            if self._maximized:
+                return True, ""            # 最大化时不用拖边框
+            if self._resize_alive:
+                return True, ""            # 上一个缩放还没结束，忽略这次
+            self._resize_alive = True
+
+        def work():
+            try:
+                pt0 = wt.POINT()
+                u.GetCursorPos(ctypes.byref(pt0))
+                rc = _WinRect()
+                u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rc))
+                left0, top0, right0, bottom0 = rc.left, rc.top, rc.right, rc.bottom
+                started = time.time()
+                while time.time() - started < RESIZE_MAX_SECONDS:
+                    if not (u.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
+                        break           # 松开左键 = 结束
+                    pt = wt.POINT()
+                    u.GetCursorPos(ctypes.byref(pt))
+                    dx, dy = pt.x - pt0.x, pt.y - pt0.y
+                    left, top, right, bottom = left0, top0, right0, bottom0
+                    if "w" in edge:
+                        left = left0 + dx
+                    if "e" in edge:
+                        right = right0 + dx
+                    if "n" in edge:
+                        top = top0 + dy
+                    if "s" in edge:
+                        bottom = bottom0 + dy
+                    try:
+                        scale = u.GetDpiForWindow(ctypes.c_void_p(hwnd)) / 96.0
+                    except Exception:
+                        scale = 1.0
+                    scale = scale or 1.0
+                    min_w = int(round(RESIZE_MIN_W * scale))
+                    min_h = int(round(RESIZE_MIN_H * scale))
+                    if right - left < min_w:
+                        if "w" in edge:
+                            left = right - min_w
+                        else:
+                            right = left + min_w
+                    if bottom - top < min_h:
+                        if "n" in edge:
+                            top = bottom - min_h
+                        else:
+                            bottom = top + min_h
+                    u.SetWindowPos(ctypes.c_void_p(hwnd), None,
+                                   int(left), int(top),
+                                   int(right - left), int(bottom - top),
+                                   SWP_NOZORDER | SWP_NOACTIVATE)
+                    time.sleep(RESIZE_POLL_SECONDS)
+            except Exception:
+                log_exception("拖动缩放窗口")
+            finally:
+                with self._lock:
+                    self._resize_alive = False
+
+        threading.Thread(target=work, daemon=True, name="gui-resize").start()
+        return True, ""
+
+    def _fix_initial_size(self, width, height):
+        """frameless 切换会把窗口缩掉一圈（FormBorderStyle.None 让窗体改用原客户区大小），
+        窗口显示后按设计尺寸校正一次，并在当前显示器工作区里居中。"""
+        u, _d = _win32()
+        hwnd = self._hwnd()
+        if not hwnd:
+            return False
+        try:
+            scale = u.GetDpiForWindow(ctypes.c_void_p(hwnd)) / 96.0
+        except Exception:
+            scale = 1.0
+        scale = scale or 1.0
+        phys_w = int(round(width * scale))
+        phys_h = int(round(height * scale))
+        x, y = 0, 0
+        try:
+            mon = u.MonitorFromWindow(ctypes.c_void_p(hwnd),
+                                      MONITOR_DEFAULTTONEAREST)
+            mi = _MonitorInfo()
+            mi.cbSize = ctypes.sizeof(_MonitorInfo)
+            if u.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(mi)):
+                work = mi.rcWork
+                x = work.left + max(0, (work.right - work.left - phys_w) // 2)
+                y = work.top + max(0, (work.bottom - work.top - phys_h) // 2)
+        except Exception:
+            rc = _WinRect()
+            u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rc))
+            x, y = rc.left, rc.top
+        u.SetWindowPos(ctypes.c_void_p(hwnd), None, int(x), int(y),
+                       phys_w, phys_h, SWP_NOZORDER | SWP_NOACTIVATE)
         return True
 
-    def set_status(self, text, color="#0a6cff"):
-        self.status.configure(text=text, foreground=color)
-
-    # ================================================== 两种关闭方式
-    def close_to_tray(self):
-        """「关闭窗口」：只关窗口，后台监控照旧（托盘图标还在）。
-
-        点窗口右上角的 × 也是同一个行为。不弹确认框。
-        """
-        self.root.destroy()
-
-    def quit_all(self):
-        """「完全退出」：连后台监控一起停掉，再关窗口。
-
-        不弹确认框。哨兵最多 5 秒内退出，托盘图标随之消失。
-        下次想恢复：顶部那个「开启后台监控」按钮，或者重开本程序。
-        """
-        self.stop_watch()
-        self.root.destroy()
-
-    def start_watch(self):
-        """把后台监控跑起来（顶部那个开关也走这里）。"""
-        self.cfg["watch_enabled"] = True
-        was = selfcheck.online()
-        ok, msg = selfcheck.start_sentinel()
-        if not ok:
-            self.set_status(msg, "#c00")
+    def _schedule_destroy(self):
+        """先让 JS 拿到返回值，再关窗口；关窗 = 进程退出（后台哨兵是独立进程）。"""
+        window = self._window
+        if window is None:
             return
-        if was:
-            self.set_status("后台已经在跑了 —— 右下角那个托盘图标就是它。")
-            self.refresh_status()
-            return
-        self.set_status("已经启动，几秒后右下角会出现托盘图标。"
-                        "（要是没看到，点任务栏那个 ∧ 展开一下，"
-                        "或者在「设置 → 个性化 → 任务栏 → 其他系统托盘图标」里把它打开）")
-        self.root.after(2500, self.refresh_status)
-        self.root.after(2500, self.refresh_logon_hint)
 
-    # ---------------------------------------------------- 体检并自动修复
-    def run_selfcheck(self):
-        """一键体检：能自己修的自己修，修不了的用人话说清楚。
-
-        为什么要做成按钮而不是让用户看日志：前面踩过的坑
-        （Failed to start embedded python interpreter / Failed to remove
-        temporary directory）都不是用户能看懂、能自己处理的东西。
-        工具应该自己发现、自己修，然后告诉人「哪一项需要你看一眼」。
-        """
-        self.set_status("正在体检…（会顺手把能自己修的问题修掉，几秒钟）")
-        self.busy_run(selfcheck.check_all, self._selfcheck_done,
-                      msg="正在体检并自动修复…")
-
-    def _selfcheck_done(self, res, err):
-        if err or not res:
-            self.set_status(f"体检失败：{err or '没有结果'}", "#c00")
-            return
-        head = selfcheck.summary(res)
-        self.set_status("体检完成：" + head)
-        self.refresh_status()
-        messagebox.showinfo(APP_TITLE, "体检完成：" + head + "\n\n"
-                            + "\n".join(selfcheck.report_lines(res)))
-
-    def run_silent(self, args=None):
-        """手动跑一次检测。
-
-        哨兵在跑的时候就留言让它自己去查 —— 这样 state.json 只有一个写入者，
-        不会两个进程抢着写、把对方的记录覆盖掉（那会导致重复通知）。
-        """
-        w = load_watch()
-        if w.get("online"):
-            request_check_now()
-            if w.get("mode") == "game":
-                self.set_status("哨兵正在游戏静默中，你的请求已经记下；"
-                                "游戏一关就立刻检测。")
-            else:
-                self.set_status("已通知哨兵立刻检测（最多 5 秒后开始），"
-                                "结果和通知都由它来出，看「状态与日志」页。")
-            return
-        run_background(args or ["--force"])
-        self.set_status("哨兵没在运行，已在后台单独跑了一次，"
-                        "完事看「状态与日志」页和通知。")
-
-    def test_toast(self):
-        notify.register_app(self.cfg.get("app_id") or "WinUpdReport.App")
-        self.busy_run(
-            lambda: notify.show("win升级报告 · 测试通知",
-                                "看到这条说明通知通道正常，点一下试试能不能打开总览页。",
-                                arg1="index"),
-            lambda r, e: self.set_status(
-                "测试通知已发送（点它试试能不能打开总览页）" if r and r[0]
-                else f"发送失败：{e or (r[1] if r else '')}", "#0a6cff" if r and r[0] else "#c00"),
-            msg="正在发通知…", widgets=(self.btn_toast, self.btn_close))
-
-    def reg(self):
-        ok = notify.register_app(self.cfg.get("app_id") or "WinUpdReport.App")
-        self.set_status("已写入注册表：通知来源 AUMID + winupdrept: 协议" if ok
-                        else "注册失败", "#0a6cff" if ok else "#c00")
-
-    def test_api(self):
-        if not self.save(quiet=True):
-            return
-        key = resolve_api_key(self.cfg)
-        if not key:
-            self.set_status("还没填 API Key：在上面「API Key」框里粘贴一个再试", "#c00")
-            return
-        import deepseek_api
-
-        def call():
-            return deepseek_api.summarize(self.cfg, key, "只回复两个字：正常", timeout=60)
-
-        def done(out, err):
-            if err:
-                self.set_status(f"API 测试失败：{err}", "#c00")
-            else:
-                self.set_status(f"API 可用：模型 {self.cfg['model']} 回复「{(out or '')[:30]}」")
-        self.busy_run(call, done, msg=f"正在测试 {self.cfg['model']}（{mask_key(key)}）…",
-                      widgets=(self.btn_apitest,))
-
-    def install_task(self):
-        if not self.save(quiet=True):
-            return
-        notify.register_app(self.cfg.get("app_id") or "WinUpdReport.App")
-        self.busy_run(
-            # 装哨兵任务，同时把旧的每日任务卸掉（哨兵已经取代它了）
-            lambda: ps_task_elevated("install", mode="watch",
-                                     also_remove=DAILY_TASK_NAME),
-            self._install_done,
-            msg="正在申请管理员权限（弹出 UAC 请点「是」，界面会一直等到你点完）…",
-            widgets=(self.btn_task_install, self.btn_task_remove))
-
-    def _install_done(self, res, err):
-        if err:
-            self.set_status(f"安装出错：{err}", "#c00")
-        else:
-            ok, msg = res
-            if ok:
-                self.set_status(
-                    f"哨兵任务已安装：登录时启动，每 "
-                    f"{self.cfg.get('watch_interval_minutes') or 5} 分钟看一次官方看板，"
-                    f"不限时、崩了会自动重启；旧的每日任务已卸掉。")
-            elif "取消" in msg or "canceled" in msg.lower():
-                self.set_status("UAC 被取消。可以改用「装/卸 登录自启」这个免管理员方案。",
-                                "#c00")
-            else:
-                self.set_status("安装失败：" + (msg or "未知原因")[:260], "#c00")
-        self.refresh_status()
-        self.refresh_task_info_async()
-
-    def remove_task(self):
-        self.busy_run(lambda: ps_task_elevated("remove", mode="watch",
-                                               also_remove=DAILY_TASK_NAME),
-                      self._remove_done,
-                      msg="正在申请管理员权限删除计划任务…",
-                      widgets=(self.btn_task_install, self.btn_task_remove))
-
-    def _remove_done(self, res, err):
-        if err:
-            self.set_status(f"删除出错：{err}", "#c00")
-        else:
-            ok, msg = res
-            self.set_status("计划任务已删除" if ok else f"删除失败：{msg[:200]}",
-                            "#0a6cff" if ok else "#c00")
-        self.refresh_status()
-        self.refresh_task_info_async()
-
-    def toggle_startup(self):
-        self.busy_run(toggle_startup, self._startup_done, msg="正在设置登录自启…",
-                      widgets=(self.btn_startup,))
-
-    def _startup_done(self, res, err):
-        if err:
-            self.set_status(f"设置出错：{err}", "#c00")
-        else:
-            ok, msg = res
-            self.set_status(msg, "#0a6cff" if ok else "#c00")
-        self.refresh_status()
-
-    def refresh_status(self):
-        """只读本地状态文件，不碰 PowerShell、不读日志，所以可以随时调。"""
-        st = load_state()
-        self.state = st
-        lines = []
-        for c in self.cfg.get("channels", []):
-            cs = (st.get("channels") or {}).get(c["id"], {})
-            lines.append(f"　{'☑' if c['enabled'] else '☐'} {c['name']}："
-                         f"{cs.get('last_version') or '未记录'}（检测 {cs.get('last_check_date') or '从未'}）")
-        pend = len(st.get("pending_notify") or [])
-        logon_date = st.get("last_logon_date") or ""
-
-        # ---- 顶部状态卡片：一眼看懂「它在不在跑」 ----
-        w = load_watch()
-        online = bool(w.get("online"))
-        gaming = (w.get("mode") == "game")
-        if online and gaming:
-            dot, color = "●", "#d97706"
-            title = "后台正在运行　（你现在全屏用着东西，它先不打扰你）"
-        elif online:
-            dot, color = "●", "#16a34a"
-            title = "后台正在运行"
-        else:
-            dot, color = "○", "#98a2b3"
-            title = "后台没在运行"
-        names = [c["name"] for c in self.cfg.get("channels", []) if c["enabled"]]
-        mins = w.get("interval_minutes") or self.cfg.get("watch_interval_minutes") or 5
-        sub = "正在盯着：" + ("、".join(names) if names else "（还没有勾任何更新线）")
-        sub += f"　　每 {mins} 分钟查一次"
-        if w.get("last_check"):
-            sub += f"　　上次检查 {w['last_check'][11:16]}"
-        if w.get("last_change"):
-            sub += f"　　上次发现新版本 {w['last_change'][:10]}"
-        self.hero_dot.configure(text=dot, fg=color)
-        self.hero_title.configure(text=title, fg="#111827")
-        self.hero_sub.configure(text=sub)
-
-        # 「还差什么才能用」——按顺序列出来，普通人照着做就行
-        todo = []
-        if not names:
-            todo.append("到「更新线」页勾一条要盯的线")
-        if not resolve_api_key(self.cfg):
-            todo.append("到「设置」页填一个 AI 的 Key（不填写不出中文报告）")
-        if not online:
-            todo.append("点右上角「开启后台监控」，它就开始盯着了")
-        if len(todo) > 1:          # 只有一条时别加序号，免得出现孤零零的「③」
-            marks = "①②③④⑤⑥"
-            todo = [f"{marks[i]}{t}" for i, t in enumerate(todo)]
-        self.hero_hint.configure(text="　".join(todo))
-        try:
-            self.btn_hero.configure(text="停止后台监控" if online
-                                    else "开启后台监控")
-            # 关闭按钮跟着状态走：后台没在跑时「关闭到托盘」是误导（那时没有图标）
-            if online:
-                self.btn_close.configure(text="关闭窗口（后台继续跑）")
-                self.btn_quit_all.configure(text="完全退出（连后台一起停）")
-                self.btn_quit_all.pack(side="right")
-            else:
-                self.btn_close.configure(text="关闭窗口")
-                self.btn_quit_all.pack_forget()
-        except Exception:
-            pass
-
-        # 哨兵现在怎么样（有没有在跑、是不是因为游戏静默了）
-        if online:
-            mode = {"game": "全屏中（先不打扰你）", "paused": "已暂停（没启用）"}.get(
-                w.get("mode"), "正常")
-            watch_txt = (f"后台：运行中　状态：{mode}　"
-                         f"上次问官方：{w.get('last_check') or '还没问过'}　"
-                         f"每 {w.get('interval_minutes')} 分钟一次　"
-                         + ("托盘图标：已挂上" if w.get("tray") else "托盘图标：没挂上"))
-        else:
-            watch_txt = ("后台：没有在运行　→ 点最上面那个「开启后台监控」，"
-                         "或者到「开机自启」页设置成开机自动运行")
-
-        sumtxt = (watch_txt + "\n"
-                  + "上次运行：" + (st.get("last_run_date") or "从未")
-                  + (f"　开机补跑：{logon_date}" if logon_date else "")
-                  + f"　待补发通知：{pend} 条　"
-                  + ("最近错误：" + (st.get("last_error") or "无")[:160]
-                     if st.get("last_error") else "最近错误：无")
-                  + "\n各条线状态：\n" + "\n".join(lines))
-        self.summary_lbl.configure(text=sumtxt)
-
-        # 手动静默 / 忽略名单
-        su = (self.cfg.get("silent_until") or "").strip()
-        active = False
-        if su:
+        def do_destroy():
             try:
-                active = dt.datetime.fromisoformat(su) > dt.datetime.now()
+                window.destroy()
             except Exception:
-                active = False
-        ign = self.cfg.get("game_ignore") or []
-        try:
-            self.quiet_lbl.configure(
-                text=((f"手动静默到 {su[:16].replace('T', ' ')}" if active
-                       else "没有手动静默")
-                      + f"　忽略名单 {len(ign)} 个" + (f"（{'、'.join(ign[:4])}）"
-                                                      if ign else "")
-                      + "　误判时点「把当前前台程序加进忽略名单」"))
-            self.btn_quiet.configure(text="取消手动静默" if active
-                                     else "现在静默 2 小时（手动）")
-        except Exception:
-            pass
+                log_exception("关闭窗口")
 
-        self.task_lbl.configure(text=self._task_text)
-        self.refresh_logon_hint()      # 里面会把「开机自启」的状态一起刷新
-        try:
-            if self.nb.nametowidget(self.nb.select()) is self.log_tab:
-                self.load_log()
-        except Exception:
-            pass
+        timer = threading.Timer(0.15, do_destroy)
+        timer.daemon = True
+        timer.start()
 
+    def _open_in_browser(self, path):
+        p = str(path or "").strip()
+        if not p:
+            return {"ok": False, "error": "没有要打开的报告或网址"}
+        low = p.lower()
+        if low.startswith(("http://", "https://", "file://")):
+            webbrowser.open(p)
+            return {"ok": True, "message": "已在浏览器里打开"}
+        target = p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
+        if not os.path.isfile(target) and os.path.isfile(p):
+            target = p
+        if not os.path.isfile(target):
+            return {"ok": False, "error": f"找不到这个文件：{p}"}
+        try:
+            if target.lower().endswith((".md", ".markdown", ".txt")):
+                with open(target, "r", encoding="utf-8", errors="replace") as f:
+                    md = f.read()
+                title = os.path.splitext(os.path.basename(target))[0]
+                html_path = os.path.splitext(target)[0] + ".html"
+                try:
+                    with open(html_path, "w", encoding="utf-8") as f:
+                        f.write(mdlite.render_page(
+                            md, title.replace("{", "{{").replace("}", "}}")))
+                except Exception:
+                    html_path = target
+                webbrowser.open("file:///" + os.path.abspath(html_path).replace("\\", "/"))
+            else:
+                webbrowser.open("file:///" + os.path.abspath(target).replace("\\", "/"))
+        except Exception as e:
+            log_exception("在浏览器里打开")
+            return {"ok": False, "error": f"打不开：{e}"}
+        return {"ok": True, "message": "已在浏览器里打开"}
+
+    def _open_folder(self, target, report_dir):
+        target = str(target or "").strip()
+        if not target:
+            target = report_dir
+        if not os.path.isdir(target):
+            # 报告文件夹在第一次生成报告前可能还不存在，顺手建出来；
+            # 其它的路径不存在就老实报错，别乱建目录。
+            try:
+                in_report_dir = (os.path.normcase(os.path.abspath(target)).startswith(
+                    os.path.normcase(os.path.abspath(report_dir))))
+            except Exception:
+                in_report_dir = False
+            if in_report_dir:
+                self._ensure_dir(target)
+        if not os.path.isdir(target):
+            return {"ok": False, "error": f"这个文件夹还不存在：{target}"}
+        os.startfile(target)                                           # noqa: S606
+        return {"ok": True, "message": "已打开文件夹"}
+
+    @staticmethod
+    def _ensure_dir(path):
+        try:
+            os.makedirs(path, exist_ok=True)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_report_path(self, file):
+        raw = str(file or "").strip()
+        if not raw:
+            return ""
+        base = self._cfg.get("report_dir") or REPORT_DIR
+        candidates = [raw]
+        if not os.path.isabs(raw):
+            candidates.append(os.path.join(BASE_DIR, raw))
+            candidates.append(os.path.join(base, raw))
+        for p in candidates:
+            try:
+                if os.path.isfile(p):
+                    return os.path.abspath(p)
+            except Exception:
+                continue
+        return ""
+
+    # ---------------------------------------------------------- 行 / 数据组装
+
+    def _reload_rows(self):
+        """界面列表 = 配置里的线 + 预设里还没加进来的线（灰显）。"""
+        cfg = self._cfg
+        cfg_ids = {c["id"] for c in cfg.get("channels", [])}
+        rows = [ch_mod.norm_channel(c) for c in cfg.get("channels", [])]
+        for c in ch_mod.all_presets():
+            c = ch_mod.norm_channel(c)
+            if c["id"] not in cfg_ids:
+                c["enabled"] = False
+                c["_preset"] = True
+                rows.append(c)
+        rows.sort(key=_row_sort_key)
+        self._rows = rows
+
+    def _merge_rows_from_cfg(self, cfg):
+        """盘上多出来的线（比如后台监控自动收录的）补进内存列表。"""
+        known = {c["id"] for c in self._rows}
+        changed = False
+        for raw in (cfg.get("channels") or []):
+            try:
+                c = ch_mod.norm_channel(raw)
+            except Exception:
+                continue
+            if c["id"] in known:
+                continue
+            c.pop("_preset", None)
+            self._rows.append(c)
+            changed = True
+        if changed:
+            self._rows.sort(key=_row_sort_key)
+
+    def _find_row(self, cid):
+        cid = str(cid or "").strip()
+        if not cid:
+            return None
+        return next((c for c in self._rows if c["id"] == cid), None)
+
+    def _cfg_with_rows(self, base):
+        """把内存里的线写回配置。只保留「启用的线 + 本来就在配置里的线」。"""
+        cfg = dict(base)
+        was = {c["id"] for c in (base.get("channels") or [])}
+        keep = []
+        for c in self._rows:
+            if not (c["enabled"] or c["id"] in was):
+                continue
+            item = {"id": c["id"], "source": c["source"],
+                    "name": c.get("name"), "enabled": bool(c["enabled"]),
+                    "arch": c.get("arch") or "amd64"}
+            if c["source"] == "flighthub":
+                item["folder"] = c.get("folder")
+            else:
+                item["category"] = c.get("category")
+                item["url"] = c.get("url")
+            keep.append(item)
+        cfg["channels"] = [ch_mod.norm_channel(x) for x in keep]
+        cfg["schema"] = 3
+        return cfg
+
+    def _persist_channels(self):
+        """线列表的启用/停用/架构/添加立刻写盘（前端是自动保存，没有「保存」按钮）。"""
+        cfg = self._cfg_with_rows(dict(self._cfg))
+        try:
+            save_config(cfg)
+        except Exception as e:
+            log_exception("保存更新线")
+            raise RuntimeError(f"存不进去：{e}")
+        self._cfg = cfg
+        return cfg
+
+    def _channels_payload(self):
+        return [self._channel_row(c) for c in self._rows]
+
+    @staticmethod
+    def _report_dict(r):
+        """state.json 里的报告条目：把可能存成相对路径的 file / html 补成绝对路径。"""
+        d = dict(r)
+        for key in ("file", "html"):
+            v = str(d.get(key) or "")
+            if v and not os.path.isabs(v):
+                d[key] = os.path.join(BASE_DIR, v)
+        return d
+
+    def _channel_row(self, c):
+        cs = ((self._state.get("channels") or {}).get(c["id"]) or {})
+        reports = [self._report_dict(r) for r in (cs.get("reports") or [])
+                   if isinstance(r, dict)]
+        row = {
+            "id": c["id"],
+            "name": c.get("name") or c["id"],
+            "source": c.get("source") or "flighthub",
+            "enabled": bool(c.get("enabled")),
+            "arch": c.get("arch") or "amd64",
+            "preset": bool(c.get("_preset")),
+            "state": {
+                "last_version": str(cs.get("last_version") or ""),
+                "last_check_date": str(cs.get("last_check_date") or ""),
+                "last_report": str(cs.get("last_report") or ""),
+                "last_error": str(cs.get("last_error") or ""),
+                "fail_count": _as_int(cs.get("fail_count"), 0),
+                "ignored": [str(x) for x in (cs.get("ignored") or [])],
+                "reports": reports,
+            },
+            "report_count": len(reports),
+        }
+        if c.get("source") == "flighthub":
+            row["folder"] = c.get("folder") or ""
+        else:
+            row["category"] = c.get("category") or ""
+            row["url"] = c.get("url") or ""
+        return row
+
+    def _watch_payload(self):
+        try:
+            w = load_watch()
+        except Exception:
+            log_exception("读取后台状态")
+            w = {"online": False}
+        cfg = self._cfg
+        online = bool(w.get("online"))
+        mode = (w.get("mode") or "normal") if online else "stopped"
+        if mode not in ("normal", "game", "paused", "stopped"):
+            mode = "normal" if online else "stopped"
+        return {
+            "online": online,
+            "mode": mode,
+            "last_check": str(w.get("last_check") or ""),
+            "last_change": str(w.get("last_change") or ""),
+            "interval_minutes": _as_int(w.get("interval_minutes")
+                                        or cfg.get("watch_interval_minutes"), 5),
+            "tray": bool(w.get("tray")),
+            "checks": _as_int(w.get("checks"), 0),
+            "errors": _as_int(w.get("errors"), 0),
+            "last_result": str(w.get("last_result") or ""),
+            "manual_until": str(w.get("manual_until") or ""),
+            "game_exe": str(w.get("game_exe") or ""),
+            "stale_seconds": _as_int(w.get("stale_seconds"), -1),
+        }
+
+    def _app_info(self):
+        try:
+            exe, args = watch_target()
+        except Exception:
+            exe, args = sys.executable, ""
+        return {
+            "title": APP_TITLE,
+            "frozen": FROZEN,
+            "is_frozen": FROZEN,
+            "base_dir": BASE_DIR,
+            "code_dir": (os.path.dirname(os.path.abspath(sys.executable))
+                         if FROZEN else BASE_DIR),
+            "exe": app_exe() or exe,
+            "log_path": LOG_PATH,
+            "report_dir": self._cfg.get("report_dir") or REPORT_DIR,
+            "task_name": TASK_NAME,
+            "startup_link": startup_link(),
+            "watch_cmd": f"{exe} {args}".strip(),
+            "webui_dir": resource_path("webui"),
+            "icon": resource_path("icon.ico"),
+        }
+
+    @staticmethod
+    def _tray_styles(cfg):
+        out = []
+        try:
+            default_id, styles = tray_mod.load_styles()
+        except Exception:
+            log_exception("读取托盘图标样式")
+            return out
+        cur = (cfg.get("tray_style") or "").strip() or default_id
+        ids = {s.get("id") for s in styles}
+        if cur not in ids:
+            cur = default_id
+        for s in styles:
+            sid = s.get("id") or ""
+            if not sid:
+                continue
+            preview = ""
+            try:
+                p = tray_mod.preview_path(sid)
+                if p and os.path.exists(p):
+                    with open(p, "rb") as f:
+                        preview = ("data:image/png;base64,"
+                                   + base64.b64encode(f.read()).decode("ascii"))
+            except Exception:
+                preview = ""
+            out.append({"id": sid, "name": s.get("name") or sid,
+                        "preview": preview, "active": sid == cur})
+        return out
+
+    # ---------------------------------------------------------- 报告列表
+
+    @staticmethod
+    def _file_key(path):
+        try:
+            return os.path.normcase(os.path.abspath(str(path or "")))
+        except Exception:
+            return str(path or "")
+
+    @staticmethod
+    def _mtime_iso(path):
+        try:
+            return dt.datetime.fromtimestamp(
+                os.path.getmtime(path)).isoformat(timespec="seconds")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _date_to_iso(date):
+        s = str(date or "").strip()
+        if not s:
+            return ""
+        try:
+            dt.date.fromisoformat(s[:10])
+            return s[:10] + "T00:00:00"
+        except Exception:
+            return ""
+
+    def _collect_reports(self):
+        """全部报告，按时间倒序：先取 state.json 里记着的，再补扫报告目录。"""
+        cfg = self._cfg
+        base = cfg.get("report_dir") or REPORT_DIR
+        names, by_slug = {}, {}
+        for raw in (cfg.get("channels") or []):
+            try:
+                c = ch_mod.norm_channel(raw)
+            except Exception:
+                continue
+            names[c["id"]] = c.get("name") or c["id"]
+            by_slug.setdefault(reporter.chan_slug(c["id"]),
+                               (c["id"], c.get("name") or c["id"]))
+        with self._lock:
+            state = self._state
+        items, seen = [], set()
+        for cid, cs in (state.get("channels") or {}).items():
+            if not isinstance(cs, dict):
+                continue
+            cname = names.get(cid)
+            if not cname:
+                try:
+                    cname = ch_mod.norm_channel({"id": cid}).get("name") or cid
+                except Exception:
+                    cname = cid
+            for r in (cs.get("reports") or []):
+                if not isinstance(r, dict):
+                    continue
+                f = str(r.get("file") or "")
+                key = self._file_key(f)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(self._report_item(
+                    cid, cname, r.get("build"), r.get("date"), f,
+                    r.get("html"), r.get("summary"), cs))
+        for path in self._scan_report_files(base):
+            key = self._file_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(self._report_item_from_path(path, by_slug))
+        items.sort(key=lambda x: (x.get("mtime") or "", x.get("build") or ""),
+                   reverse=True)
+        return items
+
+    def _report_item(self, cid, cname, build, date, file, html, summary, cs=None):
+        f = str(file or "")
+        h = str(html or "")
+        if h and not os.path.isabs(h):
+            h = os.path.join(BASE_DIR, h)
+        mtime = self._mtime_iso(f) or self._date_to_iso(date)
+        if not mtime and cs:
+            mtime = str(cs.get("last_report_at") or "")
+        return {
+            "channel_id": cid,
+            "channel_name": cname or cid,
+            "build": str(build or ""),
+            "date": str(date or ""),
+            "file": f,
+            "html": h if (h and os.path.exists(h)) else "",
+            "summary": str(summary or ""),
+            "mtime": mtime,
+        }
+
+    def _report_item_from_path(self, path, by_slug):
+        fn = os.path.basename(path)
+        m = _REPORT_NAME_RE.search(fn)
+        build = m.group(1).replace("-", ".", 1) if m else ""
+        date = m.group(2) if m else ""
+        slug = os.path.basename(os.path.dirname(path))
+        cid, cname = by_slug.get(slug, (slug, slug))
+        summary = ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                summary = reporter.one_line_summary(f.read(20000))
+        except Exception:
+            summary = ""
+        html_path = os.path.splitext(path)[0] + ".html"
+        return {
+            "channel_id": cid,
+            "channel_name": cname,
+            "build": build,
+            "date": date,
+            "file": path,
+            "html": html_path if os.path.exists(html_path) else "",
+            "summary": summary,
+            "mtime": self._mtime_iso(path),
+        }
+
+    @staticmethod
+    def _scan_report_files(base):
+        out = []
+        try:
+            for root, _dirs, files in os.walk(base):
+                for fn in files:
+                    if fn.lower().endswith(".md"):
+                        out.append(os.path.join(root, fn))
+        except Exception:
+            log_exception("扫描报告目录")
+        return out
+
+    # ---------------------------------------------------------- 后台任务 / 事件
+
+    def _push_event(self, event):
+        with self._lock:
+            self._events.append(event)
+
+    def _begin_long(self, text):
+        """占用「同一时间只做一个长操作」的锁；已有操作在跑时返回 False。"""
+        with self._lock:
+            if self._busy_text:
+                return False
+            self._busy_text = text or "处理中…"
+        self._push_event({"type": "busy", "active": True, "text": self._busy_text})
+        return True
+
+    def _end_long(self):
+        with self._lock:
+            self._busy_text = ""
+        self._push_event({"type": "busy", "active": False, "text": ""})
+
+    def _busy_error(self):
+        with self._lock:
+            busy = self._busy_text or "别的操作"
+        return f"上一个操作还没结束（{busy}），稍等一下再试"
+
+    def _run_in_thread(self, label, work, done=None, exclusive=True):
+        """后台线程干活；done(res, err) 里只能发事件，绝不碰 WebView。"""
+
+        def runner():
+            res = err = None
+            try:
+                res = work()
+            except Exception as e:
+                err = e
+                log_exception(f"后台任务「{label}」")
+            try:
+                if done:
+                    done(res, err)
+            except Exception:
+                log_exception(f"后台任务「{label}」的收尾")
+            finally:
+                if exclusive:
+                    self._end_long()
+
+        threading.Thread(target=runner, daemon=True,
+                         name="gui-" + (label or "task")[:12]).start()
+
+    def _refresh_cfg(self):
+        """只把配置里的标量重读一遍，不动内存里的线列表。"""
+        try:
+            cfg = load_config()
+        except Exception:
+            return
+        with self._lock:
+            self._cfg = cfg
+            try:
+                self._state = load_state(force=True)
+            except Exception:
+                pass
+
+    def _query_task_info_text(self):
+        try:
+            return task_info() or "未安装计划任务"
+        except Exception as e:
+            log_exception("查询计划任务")
+            return f"查询计划任务失败：{e}"
+
+    def _query_task_info_async(self):
+        """计划任务查询要 2 秒，放后台；结果缓存，poll().task_text 返回。"""
+        with self._lock:
+            if self._task_querying:
+                return
+            self._task_querying = True
+
+        def work():
+            return self._query_task_info_text()
+
+        def done(text, err):
+            with self._lock:
+                self._task_text = (text if not err else f"查询计划任务失败：{err}") \
+                    or "未安装计划任务"
+                self._task_querying = False
+                task_text = self._task_text
+            self._push_event({"type": "task_info", "text": task_text})
+
+        self._run_in_thread("查询计划任务", work, done, exclusive=False)
+
+    def _report_keys(self):
+        keys = set()
+        with self._lock:
+            state = self._state
+        for cs in ((state.get("channels") or {}).values()):
+            if not isinstance(cs, dict):
+                continue
+            for r in (cs.get("reports") or []):
+                if isinstance(r, dict):
+                    keys.add(self._file_key(r.get("file")))
+        return keys
+
+    def _run_check_live(self, extra=None, note="正在检测"):
+        """后台跑一次 checker，stdout 累积进 live。返回 False 表示已有任务在跑。"""
+        args = ["--force", "--verbose"] + list(extra or [])
+        cmd = check_cmd(args, console=False)
+        env = child_env({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
+        if not self._begin_long(note + "…（过程显示在「日志与诊断」里）"):
+            return False
+        with self._lock:
+            self._live_active = True
+            self._live_lines = []
+            self._live_rc = None
+        before = self._report_keys()
+
+        def work():
+            proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    encoding="utf-8", errors="replace",
+                                    env=env, creationflags=NO_WINDOW)
+            try:
+                for line in proc.stdout:
+                    with self._lock:
+                        self._live_lines.append(line.rstrip())
+                        if len(self._live_lines) > 400:
+                            del self._live_lines[:-400]
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                rc = proc.wait()
+            return rc
+
+        def done(rc, err):
+            with self._lock:
+                self._live_active = False
+                self._live_rc = rc
+                try:
+                    self._state = load_state(force=True)
+                except Exception:
+                    pass
+            if err:
+                self._push_event({"type": "done", "kind": "check", "ok": False,
+                                  "text": f"检测出错：{err}"})
+                return
+            if rc == 0:
+                text = "检测完成。有更新的话报告和通知已经发出去了。"
+            else:
+                text = f"检测结束了，但退出码是 {rc}，去「日志与诊断」看看上面的输出"
+            self._push_event({"type": "done", "kind": "check", "ok": rc == 0,
+                              "text": text})
+            with self._lock:
+                new_reports = bool(self._report_keys() - before)
+                channels = self._channels_payload()
+            if new_reports:
+                self._push_event({"type": "reports", "reports": self._collect_reports()})
+            self._push_event({"type": "channels", "channels": channels})
+
+        self._run_in_thread("检测", work, done)
+        return True
+
+
+# ================================================================== 入口
 
 def main():
-    root = tk.Tk()
+    """起一个 frameless 原生窗口（WebView2），标题栏由页面自己画。"""
+    import webview                      # 放在函数里：import gui 时不加载界面依赖
+
+    api = GuiApi()
+    index_path = resource_path(os.path.join("webui", "index.html"))
+    if not os.path.exists(index_path):
+        write_error_line(f"界面文件不存在：{index_path}")
+    window = webview.create_window(
+        APP_TITLE,
+        url=index_path,
+        js_api=api,
+        width=WINDOW_W,
+        height=WINDOW_H,
+        min_size=(960, 640),
+        frameless=True,                 # 不要原生标题栏/边框，标题栏由页面自绘
+        easy_drag=False,                # 整窗任意位置都能拖会很难用，只让标题栏拖
+        shadow=True,                    # 保留 DWM 阴影（pywebview 会开）
+        background_color="#F6F5F2",
+        text_select=True,
+    )
+    api._window = window
+
+    def on_shown():
+        # 窗口真正出现后才有句柄：开 Win11 圆角（Win10 会失败，忽略即可），
+        # 并把被 frameless 缩掉的尺寸补回设计值。
+        try:
+            api._apply_corner(DWMWCP_ROUND)
+        except Exception:
+            log_exception("设置窗口圆角")
+        try:
+            api._fix_initial_size(WINDOW_W, WINDOW_H)
+        except Exception:
+            log_exception("校正窗口初始尺寸")
+
     try:
-        root.call("tk", "scaling", 1.25)
+        window.events.shown += on_shown
     except Exception:
         pass
-    App(root)
-    root.mainloop()
+    icon = resource_path("icon.ico")
+    webview.start(gui="edgechromium", private_mode=True,
+                  icon=icon if os.path.exists(icon) else None)
     return 0
 
 

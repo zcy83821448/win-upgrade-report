@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>win升级报告</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<svg class="icon-defs" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-overview" viewBox="0 0 24 24"><path d="M4.2 15.6a8.4 8.4 0 1 1 15.6 0"/><path d="M12 15.2l3.4-4.8"/><circle cx="12" cy="15.2" r="1.2" fill="currentColor" stroke="none"/><path d="M4.2 15.6h-1M20.8 15.6h1"/></symbol>
+  <symbol id="i-channels" viewBox="0 0 24 24"><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="6" r="2.2"/><path d="M6 15.8V5"/><path d="M8.2 6H15.8"/><path d="M18 8.2v3.3a4 4 0 0 1-4 4H8.2"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8.8a6 6 0 1 0-12 0c0 4.3-1.6 5.9-1.6 5.9h15.2S18 13.1 18 8.8"/><path d="M10.2 18.2a2.1 2.1 0 0 0 3.6 0"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7.5h16M4 16.5h16"/><circle cx="15.2" cy="7.5" r="2.3"/><circle cx="8.8" cy="16.5" r="2.3"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.6v8.2"/><path d="M7.3 6.6a7.2 7.2 0 1 0 9.4 0"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 3.6H7.6a1.6 1.6 0 0 0-1.6 1.6v13.6a1.6 1.6 0 0 0 1.6 1.6h8.8a1.6 1.6 0 0 0 1.6-1.6V7.6z"/><path d="M14 3.6v4h4"/><path d="M9.5 12.4h5M9.5 15.8h5"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3.4" y="4.6" width="17.2" height="14.8" rx="2.4"/><path d="M7.6 9.6l2.9 2.4-2.9 2.4"/><path d="M12.4 14.8h4"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.6 12a7.6 7.6 0 1 1-2.2-5.4"/><path d="M19.6 4.2v4.6h-4.6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.6" cy="10.6" r="5.8"/><path d="M14.9 14.9l4.2 4.2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.2v13.6M5.2 12h13.6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.2 6.2l11.6 11.6M17.8 6.2L6.2 17.8"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9.2 5.6l6.2 6.4-6.2 6.4"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="M5.6 9.2l6.4 6.2 6.4-6.2"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M13.6 4.6h5.8v5.8"/><path d="M19.4 4.6l-8.2 8.2"/><path d="M18 14.2v4.6a1.6 1.6 0 0 1-1.6 1.6H4.8a1.6 1.6 0 0 1-1.6-1.6V6.4A1.6 1.6 0 0 1 4.8 4.8h4.6"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.6 7.4A1.6 1.6 0 0 1 5.2 5.8h3.9l2 2.5h7.7a1.6 1.6 0 0 1 1.6 1.6v7.7a1.6 1.6 0 0 1-1.6 1.6H5.2a1.6 1.6 0 0 1-1.6-1.6z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.6 12S6.1 5.6 12 5.6 21.4 12 21.4 12 17.9 18.4 12 18.4 2.6 12 2.6 12z"/><circle cx="12" cy="12" r="2.7"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M9.6 5.9A9.7 9.7 0 0 1 12 5.6c5.9 0 9.4 6.4 9.4 6.4a17 17 0 0 1-3.1 3.9"/><path d="M6.3 7.5A17 17 0 0 0 2.6 12S6.1 18.4 12 18.4a9.6 9.6 0 0 0 3.6-.7"/><path d="M4.4 4.4l15.2 15.2"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.6 6.6h14.8"/><path d="M9.2 6.6V4.8h5.6v1.8"/><path d="M6.6 6.6l.9 12.6a1.6 1.6 0 0 0 1.6 1.4h5.8a1.6 1.6 0 0 0 1.6-1.4l.9-12.6"/><path d="M10.2 10.4v6.6M13.8 10.4v6.6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M4.8 12.6l4.7 4.6L19.2 6.6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4.4L20.9 19.9H3.1z"/><path d="M12 10v4.3"/><circle cx="12" cy="17.1" r=".95" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4"/><path d="M12 11.2v5.2"/><circle cx="12" cy="7.9" r=".95" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.6V12l3 1.9"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8.4 5.4l10 6.6-10 6.6z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3.2" y="4.6" width="17.6" height="12" rx="2"/><path d="M8.6 20h6.8M12 16.6V20"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.6l6.8 2.5v5.4c0 4.2-2.7 7-6.8 8.9-4.1-1.9-6.8-4.7-6.8-8.9V6.1z"/><path d="M9.2 11.9l2.1 2.1 3.7-3.8"/></symbol>
+  <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M4.8 12h14.4"/><path d="M13.4 6.2L19.2 12l-5.8 5.8"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4.6v9.8"/><path d="M7.9 10.6L12 14.7l4.1-4.1"/><path d="M4.8 18.4h14.4"/></symbol>
+  <symbol id="i-win-min" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-win-max" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="1"/></symbol>
+  <symbol id="i-win-restore" viewBox="0 0 24 24"><rect x="4.5" y="9" width="10.5" height="10.5" rx="1"/><path d="M8.6 9V6.4a1.4 1.4 0 0 1 1.4-1.4h7.6a1.4 1.4 0 0 1 1.4 1.4V14a1.4 1.4 0 0 1-1.4 1.4h-2.1"/></symbol>
+</svg>
+
+<div class="app">
+
+  <header class="titlebar" id="titlebar">
+    <div class="titlebar-drag pywebview-drag-region" id="titlebarDrag">
+      <svg class="tb-mark" viewBox="0 0 16 16" aria-hidden="true">
+        <rect x="1.7" y="2.5" width="12.6" height="8.3" rx="1.5"/>
+        <path d="M5.4 13.4h5.2M8 10.8v2.6"/>
+      </svg>
+      <span class="tb-name">win升级报告</span>
+      <span class="tb-div" aria-hidden="true"></span>
+      <span class="tb-state">
+        <span class="dot dot-off" id="tbDot" data-ref="tbDot" aria-hidden="true"></span>
+        <span class="tb-state-text" id="tbStateText" data-ref="tbStateText">正在读取…</span>
+      </span>
+    </div>
+    <div class="wctl" role="group" aria-label="窗口控制">
+      <button type="button" class="wbtn" id="winMin" title="最小化" aria-label="最小化">
+        <svg class="ico" aria-hidden="true"><use href="#i-win-min"></use></svg>
+      </button>
+      <button type="button" class="wbtn" id="winMax" title="最大化" aria-label="最大化">
+        <svg class="ico" aria-hidden="true"><use href="#i-win-max"></use></svg>
+      </button>
+      <button type="button" class="wbtn wbtn-close" id="winClose" title="关闭" aria-label="关闭">
+        <svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="app-body">
+
+  <aside class="sidebar" aria-label="侧边栏">
+    <nav class="nav" aria-label="主导航">
+      <button type="button" class="nav-item is-active" data-page="overview" aria-current="page">
+        <svg class="ico" aria-hidden="true"><use href="#i-overview"></use></svg><span>概览</span>
+      </button>
+      <button type="button" class="nav-item" data-page="channels">
+        <svg class="ico" aria-hidden="true"><use href="#i-channels"></use></svg><span>更新线</span>
+      </button>
+      <button type="button" class="nav-item" data-page="notify">
+        <svg class="ico" aria-hidden="true"><use href="#i-bell"></use></svg><span>通知</span>
+      </button>
+      <button type="button" class="nav-item" data-page="settings">
+        <svg class="ico" aria-hidden="true"><use href="#i-sliders"></use></svg><span>设置</span>
+      </button>
+      <div class="nav-sep" aria-hidden="true"></div>
+      <button type="button" class="nav-item" data-page="startup">
+        <svg class="ico" aria-hidden="true"><use href="#i-power"></use></svg><span>自启与后台</span>
+      </button>
+      <button type="button" class="nav-item" data-page="reports">
+        <svg class="ico" aria-hidden="true"><use href="#i-doc"></use></svg><span>报告</span>
+      </button>
+      <button type="button" class="nav-item" data-page="logs">
+        <svg class="ico" aria-hidden="true"><use href="#i-terminal"></use></svg><span>日志与诊断</span>
+      </button>
+    </nav>
+
+    <div class="side-foot">
+      <div class="saved" id="savedHint" role="status" aria-live="polite"></div>
+      <button type="button" class="btn btn-secondary side-btn" id="btnSelfcheck">
+        <svg class="ico ico-sm" aria-hidden="true"><use href="#i-shield"></use></svg>
+        <span>体检并自动修复</span>
+      </button>
+      <div class="side-rule" aria-hidden="true"></div>
+      <div class="side-links">
+        <button type="button" class="link-btn" id="btnCloseWindow">关闭窗口</button>
+        <button type="button" class="link-btn link-danger" id="btnQuitAll">完全退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+
+    <header class="topbar">
+      <h1 class="page-title" id="pageTitle">概览</h1>
+    </header>
+
+    <main class="content" id="content">
+      <div class="content-inner">
+        <div class="boot" id="boot" aria-hidden="true">
+          <span class="spinner"></span>
+          <span>正在读取设置…</span>
+        </div>
+
+        <section class="page" data-view="overview" hidden></section>
+        <section class="page" data-view="channels" hidden></section>
+        <section class="page" data-view="notify" hidden></section>
+        <section class="page" data-view="settings" hidden></section>
+        <section class="page" data-view="startup" hidden></section>
+        <section class="page" data-view="reports" hidden></section>
+        <section class="page" data-view="logs" hidden></section>
+      </div>
+    </main>
+
+    <div class="activity" id="activity" hidden>
+      <span class="activity-rail" aria-hidden="true"><span class="activity-rail-run"></span></span>
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="activity-text" id="activityText"></span>
+    </div>
+
+  </div>
+  </div>
+</div>
+
+<div class="resizers" aria-hidden="true">
+  <div class="rz rz-n" data-edge="n"></div>
+  <div class="rz rz-s" data-edge="s"></div>
+  <div class="rz rz-w" data-edge="w"></div>
+  <div class="rz rz-e" data-edge="e"></div>
+  <div class="rz rz-nw" data-edge="nw"></div>
+  <div class="rz rz-ne" data-edge="ne"></div>
+  <div class="rz rz-sw" data-edge="sw"></div>
+  <div class="rz rz-se" data-edge="se"></div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<div class="reader" id="reader" hidden>
+  <div class="reader-panel" role="dialog" aria-modal="true" aria-labelledby="readerTitle">
+    <div class="reader-bar">
+      <div class="reader-title" id="readerTitle">报告</div>
+      <div class="reader-actions">
+        <button type="button" class="btn btn-secondary btn-sm" id="readerBrowser">
+          <svg class="ico ico-sm" aria-hidden="true"><use href="#i-external"></use></svg><span>在浏览器打开</span>
+        </button>
+        <button type="button" class="btn btn-secondary btn-sm" id="readerFolder">
+          <svg class="ico ico-sm" aria-hidden="true"><use href="#i-folder"></use></svg><span>打开文件夹</span>
+        </button>
+        <button type="button" class="icon-btn" id="readerClose" data-close-report aria-label="关闭报告">
+          <svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+    </div>
+    <div class="reader-body" id="readerBody">
+      <div class="reader-loading" id="readerLoading"><span class="spinner"></span><span>正在打开报告…</span></div>
+      <iframe id="readerFrame" title="报告内容" sandbox="allow-same-origin allow-popups"></iframe>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

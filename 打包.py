@@ -39,9 +39,18 @@ GREEN_DIR = os.path.join(APP_DIR, EXE_NAME)                 # 绿色版整个文
 ZIP_PATH = os.path.join(APP_DIR, f"{EXE_NAME}-绿色版.zip")   # 发布用的 zip
 HIDDEN = ["gui", "checker", "viewer", "reporter", "source", "deepseek_api",
           "notify", "channels", "config", "mdlite", "app", "watch", "gamesense",
-          "tray", "selfcheck"]
+          "tray", "selfcheck",
+          # 界面层：pywebview（WebView2 原生窗口）。平台模块是运行时动态导入的，
+          # PyInstaller 静态分析看不到，必须显式写出来；clr 是 pythonnet 的入口。
+          "webview", "webview.platforms.winforms", "webview.platforms.win32",
+          "webview.http", "clr", "clr_loader"]
 DATA = ["toast.ps1", "task.ps1", "icon.ico", "tray.ico"]
-DATA_DIRS = ["icons"]      # 托盘图标样式（9 套 .ico + 预览图 + styles.json）
+DATA_DIRS = ["icons", "webui"]   # icons: 托盘图标样式；webui: 设置界面的 HTML/CSS/JS
+
+# 绿色文件夹里属于「用户数据」的，重新打包时必须原样保留：
+# PyInstaller 会先删掉整个 dist 目录再生成，不备份的话用户的 Key、历史报告、
+# 日志就一起没了。
+KEEP_DATA = ["config.json", "state.json", "reports", "logs"]
 
 README_TXT = """win升级报告
 ============
@@ -49,13 +58,18 @@ README_TXT = """win升级报告
 怎么用（绿色文件夹版）
 ----------------------
 整个文件夹解压到哪都行（桌面、D 盘、U 盘都可以），双击里面的
-「win升级报告.exe」就打开设置界面。不需要安装，也不需要管理员权限。
+「win升级报告.exe」就打开设置窗口。不需要安装，也不需要管理员权限。
+
+设置窗口是原生窗口：没有浏览器、没有地址栏，整个窗口（标题栏、最小化/最大化/关闭按钮）
+都是程序自己画的，拖动标题栏移动，四边四角可以缩放。界面用 WebView2 渲染，
+Win10/11 一般自带；老机器缺了会提示装一下 Edge WebView2 Runtime。
+后台哨兵不依赖它，只有设置窗口需要。
 
 为什么是文件夹而不是一个 exe：单文件版每次启动都要把自己解压到临时目录，
 启动慢（2 秒），而且容易被临时文件清理工具、杀毒软件干扰，冒出一些
 莫名其妙的报错。文件夹版没有这一步 —— 启动 0.2 秒，也没有临时目录可以出问题。
 
-文件夹里其它东西（_internal 等）是程序运行需要的，别删；
+文件夹里其它东西（_internal、webui 等）是程序运行需要的，别删；
 也别把 exe 单独拖出来，那样它找不到自己的零件。
 
 你的数据（config.json、报告、日志）就存在这个文件夹里，
@@ -87,13 +101,13 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 不联网、不调 AI、不通知、不写盘。游戏一关，立刻补查一次。
 
 判定规则：有窗口铺满整块屏幕 + 没有标题栏 + 不是系统组件/叠加层。
-如果某个程序被误判（例如某个全屏播放器），在设置界面点
+如果某个程序被误判（例如某个全屏播放器），在设置窗口「通知」页点
 「把当前前台程序加进忽略名单」就行；也可以用「现在静默 2 小时」手动闭嘴。
 （全屏看视频也会触发这个安静模式 —— 这是故意的，不想在你专注时打扰你。）
 
 出问题了怎么办：点「体检并自动修复」
 ------------------------------------
-界面左下角有个「体检并自动修复」按钮（托盘右键菜单里也有）。它会自己检查
+左侧栏底部有个「体检并自动修复」按钮（托盘右键菜单里也有）。它会自己检查
 8 个地方，**能自己修的直接修掉**，然后用人话告诉你结果，比如：
 
     ✔ 后台监控：本来没在跑，我已经帮你启动了
@@ -105,13 +119,13 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 后台在不在跑、托盘图标挂上没挂上、开机自启设没设、有没有自己留下的垃圾临时文件、
 能不能连上微软官网。不用你懂技术，跑一遍就知道哪儿不对。
 
-如果设置界面本身打不开：右键托盘图标 →「打开程序文件夹」，
+如果设置窗口本身打不开：右键托盘图标 →「打开程序文件夹」，
 直接双击里面的 win升级报告.exe 就行。
 
 托盘图标：一眼看到它在后台跑
 ------------------------------
 哨兵一启动，任务栏右下角就有「win升级报告」的托盘图标 —— 图标在 = 它在跑。
-鼠标悬停能看到状态和上次检查时间。右键菜单可以：打开设置界面 / 立刻检测一次 /
+鼠标悬停能看到状态和上次检查时间。右键菜单可以：打开设置窗口 / 立刻检测一次 /
 静默 2 小时 / 打开报告总览 / 打开日志 / 完全关闭后台监控。
 
 看不到图标？Windows 会把新出现的托盘图标默认塞进「隐藏的图标」（任务栏那个 ∧）里。
@@ -120,8 +134,8 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 图标样式可以换
 --------------
 托盘图标有 9 套样式（线条粗细：细/标准/粗  ×  箭头占位：小/标准/大）。
-在设置界面「检测与通知」页最下面的「任务栏图标样式」下拉框里挑，
-选完立刻生效，不用重启哨兵。下面还会显示一张实际效果的预览图。
+在设置窗口「通知」页最下面的「任务栏图标」里挑，选完立刻生效，不用重启哨兵。
+每款都带一张实际效果的预览图。
 
 为什么不是选「16px / 20px」：托盘槽位大小是系统定的（你这台是 16x16），
 选哪一档分辨率都不会让屏幕上的图标变大变小；真正改变观感的是「箭头占多大地方」，
@@ -129,19 +143,20 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 
 两种关闭方式
 ------------
-设置界面右下角的按钮会跟着后台状态变（不弹确认框，点哪个就干哪个）：
+窗口标题栏是程序自己画的：右上角是最小化 / 最大化 / 关闭，左侧栏底部是
+「关闭窗口」和「完全退出」（不弹确认框，点哪个就干哪个）：
 
-  * 后台在跑时：〔关闭窗口（后台继续跑）〕＋〔完全退出（连后台一起停）〕
-      - 关闭窗口：只关设置窗口，后台哨兵继续跑，有新版本照样通知你。
+  * 〔关闭窗口〕（标题栏 × 或左侧栏底部）
+      - 只关设置窗口，后台哨兵继续跑，有新版本照样通知你。
         随时双击托盘图标就能重新打开设置。
-      - 完全退出：连后台哨兵一起停掉，托盘图标消失，以后开机也不自动起。
-        想恢复：重新双击 exe，点顶部那个「开启后台监控」。
-  * 后台没跑时：只显示〔关闭窗口〕—— 另一个按钮这时候没意义，就藏起来了。
-    点窗口右上角的 × 等同于「关闭窗口」。
+  * 〔完全退出〕（左侧栏底部）
+      - 连后台哨兵一起停掉，托盘图标消失，以后开机也不自动起。
+        想恢复：重新双击 exe，点概览页右上角的「开启后台监控」。
+  * 拖动标题栏移动窗口；双击标题栏最大化/还原；拖四边四角缩放。
 
 命令行的用法
 ------------
-win升级报告.exe                     打开设置界面
+win升级报告.exe                     打开设置窗口
 win升级报告.exe --watch             常驻哨兵（计划任务 / 登录自启用这个）
 win升级报告.exe --watch --status    看哨兵现在活着没有
 win升级报告.exe --watch --once      只跑一轮就退出（排查用）
@@ -161,15 +176,15 @@ win升级报告.exe --selftest          自检，结果写在 ..\\logs\\自检�
 --------------------
 「安装 / 更新计划任务」会弹一次 UAC（Windows 计划任务必须提权才能注册）。
 安装时会顺手把旧版的每日任务（WinUpdReport_Daily）卸掉，它已经不需要了。
-不想给权限就用「开机自启」页的「一键设置开机自启」，效果一样
+不想给权限就用「自启与后台」页的「一键设置开机自启」，效果一样
 （往「启动」文件夹放个快捷方式，登录时启动哨兵）。
 
 排查「怎么没动静了」
 --------------------
-先点界面左下角的「体检并自动修复」—— 绝大多数情况它自己就修好了，
+先点左侧栏底部的「体检并自动修复」—— 绝大多数情况它自己就修好了，
 还会用人话告诉你哪儿不对。还不行的话：
-1. 界面顶部的状态卡片 → 是「后台正在运行」还是「后台没在运行」。
-2. 「开机自启」页 → 看后台状态、托盘图标挂上没有。
+1. 「概览」页顶部状态卡片 → 是「后台正在运行」还是「后台没在运行」。
+2. 「自启与后台」页 → 看后台状态、托盘图标挂上没有。
 3. 「日志与诊断」页 → 看 logs\\checker.log 里 [哨兵] 开头的行。
 4. 命令行跑一次：win升级报告.exe --watch --status
 """
@@ -180,21 +195,71 @@ def run(cmd, **kw):
     return subprocess.call(cmd, **kw)
 
 
-def make_zip(src_dir, zip_path, top_name):
+def make_zip(src_dir, zip_path, top_name, exclude=()):
     """把绿色文件夹压成发布用的 zip。
 
     注意压缩包里要带一层同名目录（解压出来就是一个 win升级报告 文件夹，
     而不是一堆散文件散在当前目录里）。
+    exclude 里的名字（config.json / state.json / reports / logs）不打进去：
+    发布包不该带用户自己的 Key 和历史数据。
     """
     if os.path.exists(zip_path):
         os.remove(zip_path)
+    excl = {os.path.normcase(os.path.join(src_dir, e)) for e in exclude}
+
+    def excluded(full):
+        n = os.path.normcase(full)
+        return any(n == e or n.startswith(e + os.sep) for e in excl)
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for root, _dirs, files in os.walk(src_dir):
             for f in files:
                 full = os.path.join(root, f)
+                if excluded(full):
+                    continue
                 rel = os.path.relpath(full, src_dir)
                 z.write(full, os.path.join(top_name, rel))
     return zip_path
+
+
+def _backup_user_data():
+    """把绿色文件夹里的用户数据临时备份出来（打包会被清空目录）。"""
+    import tempfile
+    bak = tempfile.mkdtemp(prefix="winupd_pkg_")
+    kept = []
+    for name in KEEP_DATA:
+        src = os.path.join(GREEN_DIR, name)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(bak, name)
+        try:
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            kept.append(name)
+        except Exception as e:                                   # noqa: BLE001
+            print("  备份", name, "失败：", e)
+    print("  已备份用户数据：", "、".join(kept) if kept else "（没有）")
+    return bak, kept
+
+
+def _restore_user_data(bak, kept):
+    """打包完成后把用户数据放回去。"""
+    for name in kept:
+        src = os.path.join(bak, name)
+        dst = os.path.join(GREEN_DIR, name)
+        try:
+            if os.path.isdir(src):
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            print("  已还原", name)
+        except Exception as e:                                   # noqa: BLE001
+            print("  还原", name, "失败：", e)
+    shutil.rmtree(bak, ignore_errors=True)
 
 
 def main():
@@ -226,7 +291,17 @@ def main():
         cmd += ["--add-data", f"{os.path.join(BASE, d)};{d}"]
     cmd.append(os.path.join(BASE, "app.py"))
 
-    rc = run(cmd, cwd=BASE)
+    # 绿色文件夹版里可能有用户自己的 config.json / 历史报告 / 日志。
+    # PyInstaller 会整个清掉目标目录，所以先备份、打包后原样放回。
+    bak, kept = ("", [])
+    if not ONEFILE:
+        bak, kept = _backup_user_data()
+
+    try:
+        rc = run(cmd, cwd=BASE)
+    finally:
+        if not ONEFILE and bak:
+            _restore_user_data(bak, kept)
     if rc != 0:
         print("PyInstaller 失败，退出码", rc)
         return rc
@@ -264,20 +339,26 @@ def main():
         # 删了程序直接跑不起来（别问怎么知道的）。
 
         if "--zip" in sys.argv:
-            zp = make_zip(GREEN_DIR, ZIP_PATH, EXE_NAME)
+            zp = make_zip(GREEN_DIR, ZIP_PATH, EXE_NAME, exclude=KEEP_DATA)
             print(f"已打包发布用的 zip: {zp}"
                   f"  ({os.path.getsize(zp) / 1024 / 1024:.1f} MB)")
 
-    print("\n【这台机器怎么用】装完直接双击 exe 就打开设置界面；")
-    print("想让它在后台一直盯着，进「开机自启」页点「一键设置开机自启」。")
+    print("\n【这台机器怎么用】装完直接双击 exe 就打开设置窗口；")
+    print("想让它在后台一直盯着，进「自启与后台」页点「一键设置开机自启」。")
 
     if "--verify" in sys.argv:
         print("\n跑一次自检（窗口程序没有控制台，结果看日志文件）…")
         subprocess.call([exe, "--selftest"], cwd=os.path.dirname(exe))
         import time
         time.sleep(2)
-        log = os.path.join(BASE, "logs", "自检报告.txt")
-        if os.path.exists(log):
+        # 打包后 BASE_DIR 是 exe 同目录（配置在那里），源码运行时是工程目录。
+        log = ""
+        for cand in (os.path.join(os.path.dirname(exe), "logs", "自检报告.txt"),
+                     os.path.join(BASE, "logs", "自检报告.txt")):
+            if os.path.exists(cand):
+                log = cand
+                break
+        if log:
             print("-" * 60)
             with open(log, encoding="utf-8") as f:
                 print(f.read())

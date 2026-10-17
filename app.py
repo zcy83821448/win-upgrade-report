@@ -32,6 +32,20 @@ def out(*parts):
         pass
 
 
+def _native_error(title, text):
+    """没有控制台时的报错窗口：直接调 Windows 原生 MessageBox。
+
+    为什么不用 tkinter.messagebox：界面的渲染层已经换成 WebView2，
+    Python 这边不再需要（也不应该）为了一个错误弹窗把整个 Tk 拖进安装包。
+    """
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, str(text), str(title), 0x10)
+        return True
+    except Exception:
+        return False
+
+
 def _flush(lines_path=None):
     try:
         import config
@@ -105,24 +119,51 @@ def _selftest():
             f"创建失败 -> {_tr._error or '未知原因'}")
     except Exception as e:
         out("  托盘图标    : 失败 ->", e)
+    # 界面层：原生窗口（WebView2 渲染 HTML/CSS/JS），不再是 Tkinter。
+    # 这里只检查资源齐不齐、依赖在不在，不真的开窗口（--selftest 是无人值守跑的）。
     try:
-        import tkinter  # noqa: F401
-        out("  tkinter     : OK")
+        import webview  # noqa: F401
+        out("  pywebview   : OK", getattr(webview, "__version__", ""))
     except Exception as e:
-        out("  tkinter     : 不可用 ->", e)
+        out("  pywebview   : 不可用 ->", e)
+    ui_dir = config.resource_path("webui")
+    for name in ("index.html", "app.css", "app.js"):
+        p = os.path.join(ui_dir, name)
+        out(f"  界面资源 {name:10s}: {'OK  ' if os.path.exists(p) else '缺失'} {p}")
+    try:
+        import winreg
+        found = ""
+        for root, path in (
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"
+                 r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\Microsoft\EdgeUpdate\Clients"
+                 r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                (winreg.HKEY_CURRENT_USER,
+                 r"SOFTWARE\Microsoft\EdgeUpdate\Clients"
+                 r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}")):
+            try:
+                with winreg.OpenKey(root, path) as k:
+                    found = str(winreg.QueryValueEx(k, "pv")[0])
+                    break
+            except OSError:
+                continue
+        out("  WebView2运行时:", ("已安装 " + found) if found
+            else "没找到（Win10/11 一般自带；缺了界面打不开，装一下 Edge WebView2 Runtime）")
+    except Exception as e:
+        out("  WebView2运行时: 查询失败 ->", e)
     if "--with-gui" in sys.argv:
+        # 不开窗口，只把界面后端跑一遍：数据能正常构建就说明 UI 不会白屏。
         try:
-            import tkinter as tk
             import gui
-            root = tk.Tk()
-            root.withdraw()
-            gui.App(root)
-            root.update()
-            out("  界面构建     : OK（设置界面能正常打开）")
-            root.destroy()
+            api = gui.GuiApi()
+            boot = api.bootstrap()
+            out("  界面数据     : OK（%d 条更新线、%d 份报告）"
+                % (len(boot.get("channels") or []), len(boot.get("reports") or [])))
         except Exception as e:
             import traceback
-            out("  界面构建     : 失败 ->", e)
+            out("  界面数据     : 失败 ->", e)
             out(traceback.format_exc()[-600:])
     try:
         notify.register_app(cfg.get("app_id") or "WinUpdReport.App")
@@ -182,11 +223,6 @@ def main():
     if mode in ("--help", "-h", "help", "/?"):
         out(USAGE)
         path = _flush()
-        try:
-            import tkinter.messagebox as mb
-            mb.showinfo("win升级报告 · 用法", USAGE)
-        except Exception:
-            pass
         if path:
             try:
                 os.startfile(path)                                   # noqa: S606
@@ -237,8 +273,7 @@ if __name__ == "__main__":
         except Exception:
             pass
         try:
-            import tkinter.messagebox as mb
-            mb.showerror("win升级报告", "程序出错：\n\n" + traceback.format_exc()[-800:])
+            _native_error("win升级报告", "程序出错：\n\n" + traceback.format_exc()[-800:])
         except Exception:
             pass
         sys.exit(1)
