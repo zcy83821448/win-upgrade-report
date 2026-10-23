@@ -38,12 +38,13 @@
     reportChannelFilter: '', reportSel: '', reportHtml: new Map(),
     selfcheck: null, liveLines: [], liveActive: false, liveRc: null,
     logText: '', logPath: '', logLoaded: false, logLoading: false, logAt: null,
-    readerFile: '', readerOpen: false, readerTitle: '',
+    readerFile: '', readerOpen: false, readerTitle: '', readerToken: 0,
     foldAdvanced: false, startupTouchedAt: 0, pollTick: 0,
     maximized: false,
     chListHost: null, chDetailHost: null, checkHost: null,
     reportListHost: null, reportViewHost: null,
-    activityOn: false, lastFocus: null, previewToken: 0
+    activityOn: false, lastFocus: null, previewToken: 0,
+    lastEnabledCount: null
   };
 
   let pendingPatch = {};
@@ -107,12 +108,23 @@
   }
 
   function setRefText(name, text) {
-    $$('[data-ref="' + name + '"]').forEach(function (n) { setText(n, text); });
+    $$('[data-ref="' + name + '"]').forEach(function (n) {
+      const v = text === null || text === undefined ? '' : String(text);
+      if (n.textContent === v) return;
+      const had = n.textContent !== '';
+      n.textContent = v;
+      if (had && v) restartClass(n, 'is-updated', 560);
+    });
   }
 
   function setRefDot(name, tone, live) {
     $$('[data-ref="' + name + '"]').forEach(function (n) {
-      n.className = 'dot dot-' + tone + (live ? ' is-live' : '');
+      const next = 'dot dot-' + tone + (live ? ' is-live' : '');
+      const current = String(n.className || '').replace(/\s*is-pulse\b/g, '').trim();
+      if (current === next) return;
+      const had = current.indexOf('dot-') >= 0;
+      n.className = next;
+      if (had) restartClass(n, 'is-pulse', 700);
     });
   }
 
@@ -127,12 +139,99 @@
     $$('[data-ref="' + name + '"]').forEach(function (n) {
       const key = parts.map(function (p) { return p.text; }).join('\u0001');
       if (n.dataset.metaKey === key) return;
+      const had = !!n.dataset.metaKey;
       n.dataset.metaKey = key;
       n.textContent = '';
-      parts.forEach(function (p) {
-        n.append(el('span', { class: 'm-item' + (p.strong ? ' m-strong' : ''), text: p.text }));
+      parts.forEach(function (p, i) {
+        const item = el('span', { class: 'm-item' + (p.strong ? ' m-strong' : ''), text: p.text });
+        if (had && !motionOff()) {
+          item.classList.add('meta-in');
+          item.style.setProperty('--d', Math.min(i * 22, 110) + 'ms');
+        }
+        n.append(item);
       });
     });
+  }
+
+  /* ============================================================
+     动效：节奏与层次
+     按压反馈由 CSS 负责；这里只负责切页入场、折叠高度和数值 / 状态
+     变化时的反馈。页面内部的数据刷新不再重播放动画，避免一直"闪"。
+     ============================================================ */
+
+  function motionOff() {
+    try {
+      return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    } catch (e) { return false; }
+  }
+
+  /** 重新触发一次 CSS 动画类（先摘掉、强制回流、再加回来）。 */
+  function restartClass(node, cls, hold) {
+    if (!node || node.nodeType !== 1 || motionOff()) return node;
+    node.classList.remove(cls);
+    void node.offsetWidth;
+    node.classList.add(cls);
+    if (hold) {
+      const key = '_anim_' + cls;
+      clearTimeout(node[key]);
+      node[key] = setTimeout(function () {
+        if (node.isConnected) node.classList.remove(cls);
+      }, hold);
+    }
+    return node;
+  }
+
+  /** 这个节点上显示的数字变了一下：弹一下。 */
+  function bumpEl(node) {
+    return restartClass(node, 'is-bumped', 480);
+  }
+
+  function staggerChildren(nodes, cls, base, step, cap) {
+    if (motionOff()) return;
+    const max = cap === undefined ? 12 : cap;
+    Array.prototype.forEach.call(nodes, function (node, i) {
+      if (!node || node.nodeType !== 1) return;
+      node.style.setProperty('--d', (base + Math.min(i, max) * step) + 'ms');
+      node.classList.add(cls);
+    });
+  }
+
+  /** 页面切换：只让容器做一层很轻的入场，内容不再逐块/逐行错峰。 */
+  function playPageEnter(host) {
+    if (!host || motionOff()) return;
+    host.classList.remove('anim-page');
+    void host.offsetWidth;
+    host.classList.add('anim-page');
+    clearTimeout(host._pageTimer);
+    host._pageTimer = setTimeout(function () {
+      if (host.isConnected) host.classList.remove('anim-page');
+    }, 220);
+  }
+
+  /** 折叠 / 展开：真实高度过渡，收起后保留 hidden，便于无障碍和布局。 */
+  function animateFold(body, open) {
+    if (!body) return;
+    clearTimeout(body._foldTimer);
+    if (motionOff()) {
+      body.hidden = !open;
+      body.style.cssText = '';
+      return;
+    }
+    body.hidden = false;
+    body.style.overflow = 'hidden';
+    const start = open ? 0 : body.getBoundingClientRect().height;
+    body.style.height = start + 'px';
+    body.style.opacity = open ? '0' : '1';
+    void body.offsetHeight;
+    const end = open ? body.scrollHeight : 0;
+    body.style.transition = 'height 220ms var(--ease-out),opacity 160ms var(--ease-out)';
+    body.style.height = end + 'px';
+    body.style.opacity = open ? '1' : '0';
+    body._foldTimer = setTimeout(function () {
+      if (!body.isConnected) return;
+      body.hidden = !open;
+      body.style.cssText = '';
+    }, 240);
   }
 
   function pad2(n) { return String(n).padStart(2, '0'); }
@@ -212,11 +311,11 @@
   function watchStatusInfo() {
     const w = state.watch || {};
     const cfg = state.config || {};
-    if (!w.online) return { tone: 'off', text: '后台没在运行', live: false };
+    if (!w.online) return { tone: 'off', text: '后台监控已停止', live: false };
     const quietUntil = w.manual_until || cfg.silent_until || '';
     if (w.mode === 'game') return { tone: 'warn', text: '全屏中，先不打扰你', live: false };
     if (w.mode === 'paused') return { tone: 'warn', text: '已暂停', live: false };
-    if (w.mode === 'stopped') return { tone: 'off', text: '后台没在运行', live: false };
+    if (w.mode === 'stopped') return { tone: 'off', text: '后台监控已停止', live: false };
     if (quietUntil && isFuture(quietUntil)) return { tone: 'warn', text: '已静默到 ' + hhmm(quietUntil), live: false };
     return { tone: 'ok', text: '后台正在运行', live: true };
   }
@@ -224,11 +323,12 @@
   function statusTooltip(info) {
     if (info.tone === 'ok') return '后台正在运行 · 每 ' + intervalMinutes() + ' 分钟检查一次';
     if (info.tone === 'warn') return info.text + ' · 恢复后继续检查';
-    return '后台监控没有在运行，打开「开启后台监控」即可';
+    return '后台监控没有在运行；到概览页点「开启后台监控」即可';
   }
 
   function titlebarState(info) {
     if (info.tone === 'ok') return info.text + ' · 每 ' + intervalMinutes() + ' 分钟';
+    if (info.tone === 'off') return '监控已停止';
     return info.text;
   }
 
@@ -519,6 +619,9 @@
     bar.hidden = false;
     state.activityOn = true;
     setText($('#activityText'), text || '正在处理…');
+    bar.classList.remove('is-on');
+    void bar.offsetWidth;
+    bar.classList.add('is-on');
     document.documentElement.style.setProperty('--activity-h', '36px');
     clearTimeout(activityTimer);
     activityTimer = setTimeout(function () { hideActivity(); }, timeout || 25000);
@@ -529,16 +632,17 @@
     if (!state.activityOn) return;
     state.activityOn = false;
     const bar = $('#activity');
-    if (bar) bar.hidden = true;
+    if (bar) { bar.hidden = true; bar.classList.remove('is-on'); }
     document.documentElement.style.setProperty('--activity-h', '0px');
   }
 
   function savedHintOk() {
     const n = $('#savedHint');
     if (!n) return;
-    n.classList.remove('is-bad');
+    n.classList.remove('is-bad', 'is-pop');
     n.textContent = '已保存 ' + nowHHMM();
     n.classList.add('is-on');
+    restartClass(n, 'is-pop', 300);
     clearTimeout(savedTimer);
     savedTimer = setTimeout(function () { n.classList.remove('is-on'); }, 6000);
   }
@@ -641,12 +745,10 @@
     Object.keys(PAGE_HOSTS).forEach(function (k) { PAGE_HOSTS[k].hidden = k !== page; });
     host.hidden = false;
     renderPage(page);
-    host.classList.remove('is-entering');
-    void host.offsetWidth;
-    host.classList.add('is-entering');
+    playPageEnter(host);
     $('#content').scrollTop = 0;
     if (page === 'logs') ensureLogLoaded();
-    if (page === 'reports') ensureReportPreview();
+    if (page === 'reports' && !reportsNarrow()) ensureReportPreview();
   }
 
   function renderPage(page) {
@@ -659,7 +761,8 @@
   }
 
   function refreshPage() {
-    if (state.booted && state.page) renderPage(state.page);
+    if (!state.booted || !state.page) return;
+    renderPage(state.page);
   }
 
   /* ============================================================
@@ -870,20 +973,25 @@
     state.liveActive = active;
     state.liveRc = rc;
     if (state.page !== 'logs') return;
-    if (presenceChanged) renderPage('logs');
+    if (presenceChanged) refreshPage();
     else if (changed) updateLivePre();
-    else if (had !== (lines.length > 0 || active)) renderPage('logs');
+    else if (had !== (lines.length > 0 || active)) refreshPage();
   }
 
   /* ============================================================
      概览
      ============================================================ */
   function renderOverview(host) {
+    const reports = state.reports || [];
+    /* 首屏先给「最新报告」：用户打开这个窗口，最想知道的是这次更新了什么 */
+    if (reports.length) host.append(ovLatestCardEl(reports[0]));
+
     host.append(heroCardEl());
 
     if (!state.watch.online) {
       const tasks = overviewTasks();
-      if (tasks.length) {
+      /* 只有一步时不再单独占一张「还差几步」：上面的主按钮就是那一步 */
+      if (tasks.length > 1) {
         const card = el('div', { class: 'card todo-card' });
         tasks.forEach(function (t, i) { card.append(todoRowEl(t, i)); });
         host.append(sectionEl('还差几步', null, card));
@@ -891,19 +999,64 @@
     }
 
     const enabled = enabledChannels();
-    host.append(sectionEl('更新线状态',
-      el('span', { class: 'num', text: enabled.length ? enabled.length + ' 条已启用' : '未启用' }),
-      ovChannelCardEl()));
+    const enabledNum = el('span', {
+      class: 'num',
+      text: enabled.length ? enabled.length + ' 条已启用' : '未启用'
+    });
+    host.append(sectionEl('更新线状态', enabledNum, ovChannelCardEl()));
+    if (state.lastEnabledCount !== null && state.lastEnabledCount !== enabled.length) {
+      bumpEl(enabledNum);
+    }
+    state.lastEnabledCount = enabled.length;
 
-    const recent = (state.reports || []).slice(0, 5);
-    host.append(sectionEl('最近报告',
-      el('button', {
-        type: 'button', class: 'mini-btn', text: '全部报告',
-        onclick: function () { go('reports'); }
-      }),
-      ovReportsCardEl(recent)));
+    const older = reports.slice(1, 5);
+    const allBtn = el('button', {
+      type: 'button', class: 'mini-btn', text: '全部报告',
+      onclick: function () { go('reports'); }
+    });
+    if (older.length) {
+      host.append(sectionEl('更早的报告', allBtn, ovReportsCardEl(older)));
+    } else if (!reports.length) {
+      host.append(sectionEl('最近报告', allBtn, ovReportsCardEl([])));
+    }
 
     host.append(overviewFootEl());
+  }
+
+  function ovLatestCardEl(r) {
+    const card = el('section', { class: 'card latest-card' });
+    const main = el('div', { class: 'latest-main' },
+      el('div', { class: 'latest-head' },
+        tagEl('最新报告', 'tag-accent'),
+        el('span', {
+          class: 'latest-name',
+          text: compactName(r.channel_name) || '更新报告',
+          title: r.channel_name || ''
+        }),
+        el('span', {
+          class: 'latest-meta mono',
+          text: (r.build || '') + (r.build ? ' · ' : '') +
+            (r.date ? mmdd(r.date) : mmdd(r.mtime))
+        })
+      ),
+      el('div', {
+        class: 'latest-sum',
+        text: r.summary || '（这份报告没有一句话总结）',
+        title: r.summary || ''
+      })
+    );
+    const actions = el('div', { class: 'latest-actions' },
+      el('button', {
+        type: 'button', class: 'btn btn-primary btn-sm', text: '阅读报告',
+        onclick: function () { openReader(r.file); }
+      }),
+      el('button', {
+        type: 'button', class: 'btn btn-ghost btn-sm', text: '全部报告',
+        onclick: function () { go('reports'); }
+      })
+    );
+    card.append(main, actions);
+    return card;
   }
 
   function heroCardEl() {
@@ -922,10 +1075,6 @@
       el('button', {
         type: 'button', class: 'btn btn-secondary', text: '立刻检查',
         onclick: function () { checkNow(); }
-      }),
-      el('button', {
-        type: 'button', class: 'btn btn-secondary', text: '看报告',
-        onclick: function () { go('reports'); }
       })
     );
     card.append(main, actions);
@@ -1172,7 +1321,7 @@
           type: 'button', class: 'btn btn-secondary btn-sm', text: '清空搜索',
           onclick: function () {
             state.chQ = '';
-            renderPage('channels');
+            refreshPage();
           }
         }) : null));
       return;
@@ -1214,6 +1363,7 @@
   function renderChannelDetail() {
     const host = state.chDetailHost;
     if (!host) return;
+    const wasFilled = host.childElementCount > 0;
     host.textContent = '';
     const ch = findChannel(state.selChannel);
     if (!ch) {
@@ -1348,6 +1498,8 @@
     );
     host.append(actions);
     host.append(el('div', { class: 'field-hint', style: 'margin-top:12px', text: '检测过程会显示在「日志与诊断」页，完成后会自动更新这里的版本和报告' }));
+    /* 切换不同更新线时，右边的详情分层出现，让"内容换了"这件事有方向感 */
+    if (wasFilled) staggerChildren(host.children, 'anim-item', 0, 14, 6);
   }
 
   /* ============================================================
@@ -1589,7 +1741,8 @@
     );
     advancedRows.querySelectorAll('.settings-row').forEach(function (r) { r.style.padding = '9px 0'; });
 
-    const foldBody = el('div', { class: 'fold-body' }, advancedRows);
+    const foldInner = el('div', { class: 'fold-body-in' }, advancedRows);
+    const foldBody = el('div', { class: 'fold-body' }, foldInner);
     foldBody.hidden = !state.foldAdvanced;
     const foldHead = el('button', {
       type: 'button', class: 'fold-head', 'aria-expanded': state.foldAdvanced ? 'true' : 'false'
@@ -1600,13 +1753,23 @@
       ),
       svgIcon('chevron-down')
     );
+    const foldCard = el('div', { class: 'card fold-card' + (state.foldAdvanced ? ' is-open' : '') },
+      foldHead, foldBody);
     foldHead.addEventListener('click', function () {
-      state.foldAdvanced = !state.foldAdvanced;
-      foldHead.setAttribute('aria-expanded', state.foldAdvanced ? 'true' : 'false');
-      foldBody.hidden = !state.foldAdvanced;
+      const open = !state.foldAdvanced;
+      state.foldAdvanced = open;
+      foldHead.setAttribute('aria-expanded', open ? 'true' : 'false');
+      foldCard.classList.toggle('is-open', open);
+      animateFold(foldBody, open);
+      if (open) {
+        setTimeout(function () {
+          try {
+            foldBody.scrollIntoView({ block: 'nearest', behavior: motionOff() ? 'auto' : 'smooth' });
+          } catch (e) { /* 预览环境没有 smooth 也就算了 */ }
+        }, 300);
+      }
     });
-    host.append(el('section', { class: 'sec' },
-      el('div', { class: 'card fold-card' }, foldHead, foldBody)));
+    host.append(el('section', { class: 'sec' }, foldCard));
 
     const aboutCard = el('div', { class: 'card' },
       el('div', { class: 'settings-row' },
@@ -1778,6 +1941,13 @@
   /* ============================================================
      报告
      ============================================================ */
+  /** 窄窗口不再并排挤双栏：列表占满，点一份报告直接用阅读器打开。 */
+  function reportsNarrow() {
+    try {
+      return !!(window.matchMedia && window.matchMedia('(max-width: 1080px)').matches);
+    } catch (e) { return false; }
+  }
+
   function renderReports(host) {
     const reports = state.reports || [];
     const channelsInReports = [];
@@ -1805,6 +1975,13 @@
       el('div', { class: 'filter-bar' }, filter),
       listHost
     );
+
+    if (reportsNarrow()) {
+      state.reportViewHost = null;
+      host.append(el('div', { class: 'split cols-report single' }, left));
+      renderReportList();
+      return;
+    }
 
     const viewHost = el('div', { class: 'panel panel-pad' });
     state.reportViewHost = viewHost;
@@ -1841,6 +2018,7 @@
         title: r.file || '', onclick: function () {
           state.reportSel = r.file;
           renderReportList();
+          if (reportsNarrow()) { openReader(r.file); return; }
           renderReportView();
           ensureReportPreview();
         }
@@ -1860,10 +2038,11 @@
   function renderReportView() {
     const host = state.reportViewHost;
     if (!host) return;
+    const wasFilled = host.childElementCount > 0;
     host.textContent = '';
     const r = findReport(state.reportSel);
     if (!r) {
-      host.append(emptyEl('doc', '选一份报告', '左边点一份，这里直接看内容；也可以全屏阅读',
+      host.append(emptyEl('doc', '选一份报告', '点一份报告开始阅读；也可以去「全部报告」翻历史',
         el('button', {
           type: 'button', class: 'btn btn-secondary btn-sm', text: '打开报告文件夹',
           onclick: function () { openExternal('report_folder'); }
@@ -1882,7 +2061,7 @@
       ),
       el('div', { class: 'report-view-actions' },
         el('button', {
-          type: 'button', class: 'btn btn-secondary btn-sm', text: '全屏阅读',
+          type: 'button', class: 'btn btn-secondary btn-sm', text: '阅读模式',
           onclick: function () { openReader(r.file); }
         }),
         el('button', {
@@ -1915,6 +2094,7 @@
       ensureReportPreview();
     }
     host.append(view);
+    if (wasFilled) staggerChildren(view.children, 'anim-item', 0, 16, 4);
   }
 
   function mountReportFrame(html) {
@@ -1962,7 +2142,7 @@
       const card = el('div', { class: 'card' });
       card.append(el('div', { class: 'log-toolbar' },
         liveHead,
-        el('span', { class: 'list-count', text: state.liveLines.length + ' 行' })
+        el('span', { class: 'list-count', 'data-ref': 'liveCount', text: state.liveLines.length + ' 行' })
       ));
       const pre = el('pre', { class: 'log-pre live-pre', 'data-ref': 'livePre', tabindex: '0' });
       card.append(pre);
@@ -2038,10 +2218,16 @@
       ));
     });
     host.append(list);
+    staggerChildren(list.children, 'anim-row', 20, 22, 6);
     if (sc.summary) host.append(el('div', { class: 'check-summary', text: sc.summary }));
   }
 
   function updateLivePre() {
+    const cnt = document.querySelector('[data-ref="liveCount"]');
+    if (cnt) {
+      const t = state.liveLines.length + ' 行';
+      if (cnt.textContent !== t) { cnt.textContent = t; bumpEl(cnt); }
+    }
     const pre = document.querySelector('[data-ref="livePre"]');
     if (!pre) return;
     const text = state.liveLines.length ? state.liveLines.join('\n') : '这次检测还没有输出';
@@ -2272,10 +2458,10 @@
     'html,body{background:#fff!important;margin:0!important;padding:0!important;color:#1C1B19}' +
     /* 字号与后端的应用内嵌字号保持一致（13.5px 正文 / 21px h1），这里只做兜底、不加 !important，
        后端注入的 !important 规则始终优先，避免两套字号打架 */
-    'body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;font-size:13.5px;line-height:1.75}' +
+    'body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;font-size:13.5px;line-height:1.7}' +
     'h1{font-size:21px;line-height:1.4;font-weight:600}' +
     'img{max-width:100%;height:auto}a{color:#1F5AE0}' +
-    'main{box-shadow:none!important;border-radius:0!important;background:#fff!important}' +
+    'main{box-shadow:none!important;border-radius:0!important;background:#fff!important;max-width:560px;margin:0 auto;padding:24px 28px}' +
     '::-webkit-scrollbar{width:10px}::-webkit-scrollbar-track{background:transparent}' +
     '::-webkit-scrollbar-thumb{background:#D8D3CA;border:3px solid #fff;background-clip:padding-box;border-radius:8px}' +
     '</style>';
@@ -2293,24 +2479,30 @@
     state.readerFile = file;
     state.lastFocus = document.activeElement;
     state.readerOpen = true;
+    state.readerToken++;
     const reader = $('#reader');
+    if (reader) reader.classList.remove('is-closing');
     const frame = $('#readerFrame');
     const loading = $('#readerLoading');
-    setText($('#readerTitle'), fileStem(file));
+    const r = findReport(file);
+    const niceTitle = r
+      ? ((compactName(r.channel_name) || '更新报告') + (r.build ? ' · ' + r.build : ''))
+      : fileStem(file);
+    setText($('#readerTitle'), niceTitle);
     loading.hidden = false;
     frame.style.visibility = 'hidden';
     frame.srcdoc = '';
     reader.hidden = false;
-    const closeBtn = $('#readerClose');
-    if (closeBtn) closeBtn.focus();
-    const r = findReport(file);
+    /* 焦点给面板本身：鼠标打开时不显示按钮上的蓝色焦点环，键盘 Tab 再进操作区 */
+    const panel = reader.querySelector('.reader-panel');
+    if (panel && panel.focus) panel.focus();
     const a = bridge();
     if (!a) return;
     try {
       const res = await a.report_html(file);
       if (!state.readerOpen || state.readerFile !== file) return;
       if (res && res.ok) {
-        setText($('#readerTitle'), res.title || (r ? (r.channel_name || '') + ' · ' + (r.build || '') : fileStem(file)));
+        setText($('#readerTitle'), r ? niceTitle : (res.title || fileStem(file)));
         frame.srcdoc = reportDoc(res.html || '');
       } else {
         frame.srcdoc = reportDoc('<div style="padding:40px;font-family:Segoe UI,Microsoft YaHei UI,sans-serif;font-size:13px;color:#5F5B54">这份报告打不开：' +
@@ -2331,11 +2523,19 @@
   function closeReader() {
     const reader = $('#reader');
     if (!reader || reader.hidden) return;
-    reader.hidden = true;
     state.readerOpen = false;
-    const frame = $('#readerFrame');
-    if (frame) frame.srcdoc = '';
-    if (state.lastFocus && state.lastFocus.isConnected) state.lastFocus.focus();
+    const token = ++state.readerToken;
+    const finish = function () {
+      if (token !== state.readerToken) return;
+      reader.hidden = true;
+      reader.classList.remove('is-closing');
+      const frame = $('#readerFrame');
+      if (frame) frame.srcdoc = '';
+      if (state.lastFocus && state.lastFocus.isConnected) state.lastFocus.focus();
+    };
+    if (motionOff()) { finish(); return; }
+    reader.classList.add('is-closing');
+    setTimeout(finish, 150);
   }
 
   /* ============================================================
@@ -2477,6 +2677,18 @@
     });
 
     document.addEventListener('keydown', onKeydown);
+
+    /* 窗口宽度跨过断点时，报告页在「双栏预览 / 单栏点开阅读」之间切换 */
+    let reportsWide = !reportsNarrow();
+    window.addEventListener('resize', function () {
+      const wide = !reportsNarrow();
+      if (wide === reportsWide) return;
+      reportsWide = wide;
+      if (state.page === 'reports') {
+        state.reportViewHost = null;
+        renderPage('reports');
+      }
+    });
   }
 
   async function closeWindow() {

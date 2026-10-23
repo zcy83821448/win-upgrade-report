@@ -64,7 +64,7 @@
       <button type="button" class="wbtn" id="winMax" title="最大化" aria-label="最大化">
         <svg class="ico" aria-hidden="true"><use href="#i-win-max"></use></svg>
       </button>
-      <button type="button" class="wbtn wbtn-close" id="winClose" title="关闭" aria-label="关闭">
+      <button type="button" class="wbtn wbtn-close" id="winClose" title="关闭窗口（后台继续运行）" aria-label="关闭窗口，后台继续运行">
         <svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg>
       </button>
     </div>
@@ -99,15 +99,15 @@
     </nav>
 
     <div class="side-foot">
-      <div class="saved" id="savedHint" role="status" aria-live="polite"></div>
       <button type="button" class="btn btn-secondary side-btn" id="btnSelfcheck">
         <svg class="ico ico-sm" aria-hidden="true"><use href="#i-shield"></use></svg>
         <span>体检并自动修复</span>
       </button>
       <div class="side-rule" aria-hidden="true"></div>
+      <div class="side-hint">关闭窗口后，后台继续监控</div>
       <div class="side-links">
-        <button type="button" class="link-btn" id="btnCloseWindow">关闭窗口</button>
-        <button type="button" class="link-btn link-danger" id="btnQuitAll">完全退出</button>
+        <button type="button" class="link-btn" id="btnCloseWindow" title="只关闭设置窗口，后台监控继续运行">关闭窗口</button>
+        <button type="button" class="link-btn link-danger" id="btnQuitAll" title="停止后台监控并退出程序">完全退出</button>
       </div>
     </div>
   </aside>
@@ -116,6 +116,9 @@
 
     <header class="topbar">
       <h1 class="page-title" id="pageTitle">概览</h1>
+      <div class="topbar-meta">
+        <span class="saved" id="savedHint" role="status" aria-live="polite"></span>
+      </div>
     </header>
 
     <main class="content" id="content">
@@ -159,7 +162,7 @@
 <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
 <div class="reader" id="reader" hidden>
-  <div class="reader-panel" role="dialog" aria-modal="true" aria-labelledby="readerTitle">
+  <div class="reader-panel" role="dialog" aria-modal="true" aria-labelledby="readerTitle" tabindex="-1">
     <div class="reader-bar">
       <div class="reader-title" id="readerTitle">报告</div>
       <div class="reader-actions">
@@ -169,7 +172,7 @@
         <button type="button" class="btn btn-secondary btn-sm" id="readerFolder">
           <svg class="ico ico-sm" aria-hidden="true"><use href="#i-folder"></use></svg><span>打开文件夹</span>
         </button>
-        <button type="button" class="icon-btn" id="readerClose" data-close-report aria-label="关闭报告">
+        <button type="button" class="icon-btn" id="readerClose" data-close-report title="关闭阅读（Esc）" aria-label="关闭阅读">
           <svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg>
         </button>
       </div>

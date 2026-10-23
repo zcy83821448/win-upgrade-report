@@ -373,15 +373,15 @@ _REPORT_EMBED_CSS = """<style id="winupd-embed">
    让报告看起来是界面的一部分而不是另一个网站。 */
 html,body{background:#fff !important;padding:0 !important;margin:0 !important;color-scheme:light}
 body{color:#1C1B19 !important}
-main{box-shadow:none !important;border-radius:0 !important;max-width:none !important;
- margin:0 !important;padding:28px 40px !important;background:#fff !important}
+main{box-shadow:none !important;border-radius:0 !important;max-width:560px !important;
+ margin:0 auto !important;padding:24px 28px !important;background:#fff !important}
 a{color:#1F5AE0 !important}
 /* 应用内嵌字号：报告页自带的 PAGE 样式是「网页阅读」尺寸（h1 27px 等），
-   塞进宽约 480px 的右侧面板后标题会被折成好几行、正文也偏大。这里整体降一档，
-   全屏阅读器用同一套也合适。字号/间距放媒体查询前面，深色那套颜色仍然最后生效。 */
+   塞进窄面板后标题会被折成好几行、正文也偏大。这里整体降一档；
+   阅读器里再用 560px 的行宽上限，避免一行拉到 60 多个汉字。 */
 body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif !important;
  font-size:13.5px !important;line-height:1.7 !important}
-main{padding:24px 30px !important}
+main{padding:24px 28px !important}
 h1{font-size:21px !important;line-height:1.35 !important;margin:0 0 8px !important}
 h2{font-size:16.5px !important;margin:22px 0 8px !important;padding-bottom:5px !important}
 h3{font-size:14.5px !important;margin:16px 0 6px !important}
@@ -391,6 +391,20 @@ ul,ol{padding-left:20px !important}
 table{font-size:12.5px !important}
 code,pre{font-size:12px !important}
 blockquote{font-size:13px !important}
+/* 滚动条也走应用自己的样式，不再出现 Windows 默认的宽灰条 */
+html{scrollbar-gutter:stable}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#D8D3CA;border:3px solid #fff;
+ background-clip:padding-box;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#C7C1B6;background-clip:padding-box}
+/* 右侧预览面板只有 300～500px：把缩进收小，正文能多放几个字。 */
+@media (max-width:620px){
+ main{max-width:none !important;padding:20px 22px !important}
+ h1{font-size:19px !important}
+ h2{font-size:16px !important}
+ p,li{font-size:13px !important;line-height:1.65 !important}
+}
 @media (prefers-color-scheme:dark){
  html,body{background:#fff !important;color:#1C1B19 !important}
  body{color:#1C1B19 !important}

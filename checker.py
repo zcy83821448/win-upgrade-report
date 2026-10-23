@@ -516,16 +516,19 @@ def report_arg(cid, build):
 
 
 def _show_one(app_id, title, body, arg1=None, url=None):
-    """发一条通知。有官方原文链接时，第二个按钮就直接指向那篇官方说明。
+    """发一条通知。有具体报告时第一个按钮是「查看报告」，没有就只给「打开总览」。
 
-    （viewer.py 已经支持打开网址，所以这里不用改查看器。）
+    有官方原文链接时，第二个按钮直接指向那篇官方说明；否则不再重复放一个
+    同样去总览的按钮（合并通知以前会出现两个都打开总览的按钮）。
     """
     kw = {"app_id": app_id, "arg1": arg1 or "index",
           "button1": "查看报告" if arg1 else "打开总览"}
     if url:
         kw["arg2"], kw["button2"] = url, "官方原文"
-    else:
+    elif arg1:
         kw["arg2"], kw["button2"] = "index", "打开总览"
+    else:
+        kw["arg2"], kw["button2"] = "", ""
     ok, _msg = notify.show(title, body, **kw)
     return bool(ok)
 
@@ -551,7 +554,7 @@ def send_notifications(cfg, updates):
         if len(updates) > 6:
             lines.append(f"…等共 {len(updates)} 条线")
         if _show_one(app_id, f"有 {len(updates)} 条更新线出了新版本",
-                     "\n".join(lines), "index", None):
+                     "\n".join(lines), None, None):
             sent = [u["build"] for u in updates]
         return sent
 
@@ -574,7 +577,9 @@ def send_pending(cfg, pending):
     if len(pending) == 1:
         p = pending[0]
         ok = _show_one(app_id, f"{p['name']} 有新版本：{p['build']}",
-                       (p.get("summary") or "")[:200], "index", p.get("url"))
+                       (p.get("summary") or "")[:200],
+                       report_arg(p["cid"], p["build"]) if p.get("cid") else "index",
+                       p.get("url"))
         return [p["build"]] if ok else []
 
     lines = [f"· {p['name']}：{p.get('prev', '')} → {p['build']}"
@@ -582,7 +587,7 @@ def send_pending(cfg, pending):
     if len(pending) > 6:
         lines.append(f"…等共 {len(pending)} 条")
     ok = _show_one(app_id, f"这段时间有 {len(pending)} 条更新（之前是静默时段）",
-                   "\n".join(lines), "index", None)
+                   "\n".join(lines), None, None)
     return [p["build"] for p in pending] if ok else []
 
 
