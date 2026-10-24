@@ -14,6 +14,7 @@
   --ink-3:#6F6A61;
   --accent:#1F5AE0;
   --accent-soft:#EDF2FD;
+  --accent-text:#1F5AE0;
   --accent-top:#2A63E6;
   --accent-strong:#1949B8;
   --accent-line:#C7D6F7;
@@ -158,8 +159,8 @@ body.personalized .btn-secondary{background:rgba(255,255,255,.82)}
 /* 深色卡片：卡片内整套文字/控件都要换成浅色系（不然白字压在浅底上） */
 body.personalized.pg-dark{
   --ink:#F2EFE9;
-  --ink-2:#CFC9BF;
-  --ink-3:#A9A298;
+  --ink-2:#DCD6CC;
+  --ink-3:#C6C0B5;
   --paper-line:rgba(255,255,255,.15);
   --paper-line-strong:rgba(255,255,255,.24);
   --surface:rgba(255,255,255,.10);
@@ -498,7 +499,7 @@ body.is-maximized .resizers{display:none}
 .mini-btn:active{transform:translateY(1px);opacity:.7}
 .link{
   border:0;background:transparent;padding:0;cursor:pointer;
-  color:var(--accent);font-size:inherit;
+  color:var(--accent-text);font-size:inherit;
   border-bottom:1px solid transparent;
   transition:border-color var(--t) var(--ease);
 }
@@ -515,7 +516,7 @@ body.is-maximized .resizers{display:none}
 .dot-warn{color:var(--warn)}
 .dot-off{color:#B9B3A8}
 .dot-bad{color:var(--bad)}
-.dot-accent{color:var(--accent)}
+.dot-accent{color:var(--accent-text)}
 .dot.is-live::after{
   content:"";position:absolute;inset:-3px;border-radius:50%;
   border:1px solid currentColor;opacity:.28;
@@ -534,7 +535,7 @@ body.is-maximized .resizers{display:none}
   text-transform:none;letter-spacing:.02em;font-size:11px;
   border-color:var(--paper-line);color:var(--ink-3);
 }
-.tag-accent{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
+.tag-accent{border-color:var(--accent-line);color:var(--accent-text);background:var(--accent-soft)}
 .tag-ok{border-color:#CDE5D9;color:var(--ok);background:var(--ok-soft)}
 .tag-warn{border-color:#EEDDBF;color:var(--warn);background:var(--warn-soft)}
 .tag-bad{border-color:#F0D3CF;color:var(--bad);background:var(--bad-soft)}
@@ -836,7 +837,7 @@ select.input{
 .todo-row:first-child{border-top:0}
 .todo-row:hover{background:transparent}
 .todo-row:hover .todo-label{color:var(--ink)}
-.todo-row:hover .todo-go{color:var(--accent)}
+.todo-row:hover .todo-go{color:var(--accent-text)}
 .todo-idx{
   font-family:var(--mono);font-size:11px;color:var(--ink-3);
   width:18px;flex:none;padding-top:1px;
@@ -872,7 +873,7 @@ select.input{
   min-width:0;border:0;background:transparent;padding:0;
   font-size:12.5px;color:var(--ink);text-align:left;cursor:pointer;
 }
-.mini-name:hover{color:var(--accent)}
+.mini-name:hover{color:var(--accent-text)}
 .mini-name .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mini-cell{font-size:12px;color:var(--ink-2);font-variant-numeric:tabular-nums}
 .mini-cell.mono{font-size:12px}
@@ -1056,7 +1057,7 @@ select.input{
 }
 .tray-tile:hover img,.tray-tile[aria-pressed="true"] img{filter:none;opacity:1}
 .tray-name{font-size:11px;color:var(--ink-3);line-height:1.3;text-align:center}
-.tray-tile[aria-pressed="true"] .tray-name{color:var(--accent)}
+.tray-tile[aria-pressed="true"] .tray-name{color:var(--accent-text)}
 
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chip{
@@ -1238,7 +1239,7 @@ select.input{
 }
 .check-badge .ico{width:12px;height:12px;stroke-width:2}
 .check-badge.ok{background:var(--ok-soft);color:var(--ok)}
-.check-badge.fixed{background:var(--accent-soft);color:var(--accent)}
+.check-badge.fixed{background:var(--accent-soft);color:var(--accent-text)}
 .check-badge.warn{background:var(--warn-soft);color:var(--warn)}
 .check-badge.fail{background:var(--bad-soft);color:var(--bad)}
 .check-main{min-width:0;flex:1}
@@ -1394,7 +1395,7 @@ select.input{
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 .picker-add{flex:none;font-size:11.5px;color:var(--ink-3)}
-.picker-row:hover .picker-add{color:var(--accent)}
+.picker-row:hover .picker-add{color:var(--accent-text)}
 .picker-empty{padding:24px 18px 26px;text-align:center;font-size:12.5px;color:var(--ink-3)}
 
 /* ============================================================

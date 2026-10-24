@@ -2835,6 +2835,7 @@
       root.style.removeProperty('--card-rgb');
       root.style.removeProperty('--card-line');
       ['--accent-soft', '--accent-line'].forEach(function (k) { root.style.removeProperty(k); });
+      root.style.removeProperty('--accent-text');
       return;
     }
     const a = (Number(p.scrim_alpha) || 0) / 100;
@@ -2873,12 +2874,19 @@
           'rgba(' + ar.r + ',' + ar.g + ',' + ar.b + ',.18)');
         root.style.setProperty('--accent-line',
           'rgba(' + ar.r + ',' + ar.g + ',' + ar.b + ',.45)');
+        /* 深色卡片上的强调色文字要提亮，不然链接/标签会糊在深底上 */
+        root.style.setProperty('--accent-text',
+          hslToHex(accentHsl.h, clampNum(accentHsl.s, 0.40, 0.85),
+            clampNum(accentHsl.l + 0.26, 0.64, 0.80)));
       } else {
         root.style.setProperty('--accent-soft',
           hslToHex(accentHsl.h, Math.max(0.30, accentHsl.s - 0.10), 0.95));
         root.style.setProperty('--accent-line',
           hslToHex(accentHsl.h, Math.max(0.28, accentHsl.s - 0.18), 0.85));
+        root.style.setProperty('--accent-text', String(p.accent || ''));
       }
+    } else {
+      root.style.removeProperty('--accent-text');
     }
   }
 
