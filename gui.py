@@ -531,6 +531,119 @@ def _win32():
     return u, d
 
 
+# ======================================================= 个性化背景图（文件 / 选图）
+
+PERSONAL_DIR_NAME = "personalize"
+PERSONAL_PICK_MAX = 25 * 1024 * 1024      # 选进来的原图上限
+PERSONAL_SAVE_MAX = 12 * 1024 * 1024      # 裁切后写盘的上限
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".webp": "image/webp", ".bmp": "image/bmp", ".gif": "image/gif"}
+
+
+class _OpenFileNameW(ctypes.Structure):
+    """comdlg32.GetOpenFileNameW 的参数结构（只用得到前几个字段）。"""
+    _fields_ = [
+        ("lStructSize", wt.DWORD),
+        ("hwndOwner", ctypes.c_void_p),
+        ("hInstance", ctypes.c_void_p),
+        ("lpstrFilter", wt.LPCWSTR),
+        ("lpstrCustomFilter", wt.LPWSTR),
+        ("nMaxCustFilter", wt.DWORD),
+        ("nFilterIndex", wt.DWORD),
+        ("lpstrFile", wt.LPWSTR),
+        ("nMaxFile", wt.DWORD),
+        ("lpstrFileTitle", wt.LPWSTR),
+        ("nMaxFileTitle", wt.DWORD),
+        ("lpstrInitialDir", wt.LPCWSTR),
+        ("lpstrTitle", wt.LPCWSTR),
+        ("Flags", wt.DWORD),
+        ("nFileOffset", wt.WORD),
+        ("nFileExtension", wt.WORD),
+        ("lpstrDefExt", wt.LPCWSTR),
+        ("lCustData", wt.LPARAM),
+        ("lpfnHook", ctypes.c_void_p),
+        ("lpTemplateName", wt.LPCWSTR),
+        ("pvReserved", ctypes.c_void_p),
+        ("dwReserved", wt.DWORD),
+        ("FlagsEx", wt.DWORD),
+    ]
+
+
+def _ask_open_image(owner=0):
+    """用系统选图对话框挑一张图片；用户取消返回空串。
+
+    不用 pywebview 的 create_file_dialog：那个必须在 GUI 线程上跑，而
+    js_api 方法是在别的线程里被调用的。
+    """
+    inited = False
+    ole32 = None
+    try:
+        ole32 = ctypes.WinDLL("ole32")
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wt.DWORD]
+        ole32.CoUninitialize.argtypes = []
+        inited = ole32.CoInitializeEx(None, 0x2) in (0, 1)   # STA
+    except Exception:
+        inited = False
+    try:
+        comdlg = ctypes.WinDLL("comdlg32")
+        comdlg.GetOpenFileNameW.argtypes = [ctypes.POINTER(_OpenFileNameW)]
+        comdlg.GetOpenFileNameW.restype = wt.BOOL
+        buf = ctypes.create_unicode_buffer(4096)
+        ofn = _OpenFileNameW()
+        ofn.lStructSize = ctypes.sizeof(_OpenFileNameW)
+        ofn.hwndOwner = ctypes.c_void_p(int(owner or 0))
+        ofn.lpstrFilter = ("图片\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.gif\0"
+                           "所有文件\0*.*\0")
+        ofn.lpstrFile = ctypes.cast(buf, wt.LPWSTR)
+        ofn.nMaxFile = len(buf)
+        ofn.lpstrTitle = "选一张背景图片"
+        # EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST | NOCHANGEDIR
+        ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008
+        ok = comdlg.GetOpenFileNameW(ctypes.byref(ofn))
+        return buf.value if ok else ""
+    finally:
+        if inited and ole32 is not None:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
+
+
+def _file_data_url(path):
+    """把图片文件读成 data URL（前端要拿它画画、算平均色）。"""
+    size = os.path.getsize(path)
+    if size > PERSONAL_PICK_MAX:
+        raise ValueError("图片太大了（超过 25 MB），换一张小一点的吧")
+    ext = os.path.splitext(path)[1].lower()
+    mime = _IMAGE_MIME.get(ext)
+    if not mime:
+        raise ValueError("只支持 png / jpg / webp / bmp / gif 图片")
+    with open(path, "rb") as f:
+        raw = f.read()
+    return "data:" + mime + ";base64," + base64.b64encode(raw).decode("ascii")
+
+
+def _decode_image_data_url(data_url):
+    """前端裁切完传回来的 data URL → (bytes, 扩展名)；不合法返回 (None, "")。"""
+    s = str(data_url or "")
+    m = re.match(r"^data:image/(png|jpeg|jpg);base64,(.+)$", s, re.S)
+    if not m:
+        return None, ""
+    try:
+        raw = base64.b64decode(m.group(2), validate=True)
+    except Exception:
+        return None, ""
+    if len(raw) > PERSONAL_SAVE_MAX:
+        raise ValueError("裁切后的图片太大了，换一张小一点的吧")
+    if m.group(1) == "png":
+        if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None, ""
+        return raw, ".png"
+    if not raw.startswith(b"\xff\xd8\xff"):
+        return None, ""
+    return raw, ".jpg"
+
+
 # ================================================================== JS 后端
 
 class GuiApi:
@@ -545,7 +658,9 @@ class GuiApi:
     _INT_KEYS = ("max_tokens", "request_timeout", "retries", "max_workers",
                  "max_context_chars", "interval_days", "keep_reports",
                  "notify_on_error_after", "watch_interval_minutes",
-                 "game_exit_hold_seconds", "tick_seconds")
+                 "game_exit_hold_seconds", "tick_seconds",
+                 "personalize_blur", "personalize_card_alpha",
+                 "personalize_scrim_alpha")
     _FLOAT_KEYS = ("temperature",)
     _BOOL_KEYS = ("notify", "merge_notifications", "include_official_text",
                   "disable_thinking", "auto_discover_channels", "watch_enabled",
@@ -553,7 +668,8 @@ class GuiApi:
                   "tray_hint_shown", "open_report_on_click")
     _STR_KEYS = ("api_base", "api_key", "model", "proxy", "detail", "app_id",
                  "report_dir", "silent_until", "check_time", "uup_url",
-                 "tray_style", "quiet_hours")
+                 "tray_style", "quiet_hours", "personalize_bg",
+                 "personalize_accent")
     _KNOWN_KEYS = frozenset(DEFAULTS.keys())
     _LABELS = {
         "watch_interval_minutes": "多久检查一次（分钟）",
@@ -623,6 +739,7 @@ class GuiApi:
             "reports": self._collect_reports(),
             "tray_styles": self._tray_styles(cfg),
             "detail_options": list(DETAIL_OPTIONS),
+            "personalize": self._personalize_payload(cfg),
             "task_text": task_text,
             "startup": {"enabled": os.path.exists(startup_link())},
             "now": _now_iso(),
@@ -944,6 +1061,15 @@ class GuiApi:
             return "「随机程度」需要填数字"
         if cfg.get("detail") not in DETAIL_OPTIONS:
             cfg["detail"] = "标准"
+        # 个性化：参数夹在合理范围内，别让坏值把界面搞成没法看
+        cfg["personalize_blur"] = max(
+            0, min(80, _as_int(cfg.get("personalize_blur"), 15)))
+        cfg["personalize_card_alpha"] = max(
+            40, min(98, _as_int(cfg.get("personalize_card_alpha"), 70)))
+        cfg["personalize_scrim_alpha"] = max(
+            0, min(70, _as_int(cfg.get("personalize_scrim_alpha"), 0)))
+        acc = str(cfg.get("personalize_accent") or "").strip()
+        cfg["personalize_accent"] = acc if re.match(r"^#[0-9a-fA-F]{6}$", acc) else ""
         return ""
 
     @_guard
@@ -1015,6 +1141,124 @@ class GuiApi:
         for w in windows:
             w["ignored"] = w["name"].lower() in ignored
         return {"ok": True, "windows": windows}
+
+    # ============================================================ 个性化
+
+    def _personalize_path(self, cfg=None):
+        cfg = cfg if cfg is not None else self._cfg
+        rel = str(cfg.get("personalize_bg") or "").strip()
+        if not rel:
+            return ""
+        return rel if os.path.isabs(rel) else os.path.join(BASE_DIR, rel)
+
+    def _personalize_payload(self, cfg=None):
+        """首屏给前端：背景图 data URL + 三个参数 + 算出来的强调色。"""
+        if cfg is None:
+            with self._lock:
+                cfg = self._cfg
+        path = self._personalize_path(cfg)
+        bg = ""
+        if path and os.path.isfile(path):
+            try:
+                bg = _file_data_url(path)
+            except Exception:
+                log_exception("读取背景图片")
+                bg = ""
+        return {
+            "bg_url": bg,
+            "accent": str(cfg.get("personalize_accent") or ""),
+            "blur": _as_int(cfg.get("personalize_blur"), 15),
+            "card_alpha": _as_int(cfg.get("personalize_card_alpha"), 70),
+            "scrim_alpha": _as_int(cfg.get("personalize_scrim_alpha"), 0),
+        }
+
+    @_guard
+    def pick_personal_image(self):
+        """弹系统选图框，把原图以 data URL 交给前端去裁。"""
+        try:
+            owner = self._hwnd()
+        except Exception:
+            owner = 0
+        try:
+            path = _ask_open_image(owner)
+        except Exception as e:
+            log_exception("选择背景图片")
+            return {"ok": False, "error": f"打不开选图对话框：{e}"}
+        if not path:
+            return {"ok": True, "cancelled": True}
+        try:
+            data_url = _file_data_url(path)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "data_url": data_url, "name": os.path.basename(path)}
+
+    @_guard
+    def save_personal_image(self, data_url=None, accent=""):
+        try:
+            raw, ext = _decode_image_data_url(data_url)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        if not raw:
+            return {"ok": False, "error": "图片数据不对，重新裁切一次试试"}
+        acc = str(accent or "").strip()
+        if not re.match(r"^#[0-9a-fA-F]{6}$", acc):
+            acc = ""
+        folder = os.path.join(BASE_DIR, PERSONAL_DIR_NAME)
+        name = "bg" + ext
+        try:
+            os.makedirs(folder, exist_ok=True)
+            for old in os.listdir(folder):
+                if old.lower().startswith("bg."):
+                    try:
+                        os.remove(os.path.join(folder, old))
+                    except Exception:
+                        pass
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(raw)
+        except Exception as e:
+            log_exception("保存背景图片")
+            return {"ok": False, "error": f"保存背景图片失败：{e}"}
+        with self._lock:
+            cfg = load_config()
+            cfg["personalize_bg"] = PERSONAL_DIR_NAME + "/" + name
+            cfg["personalize_accent"] = acc
+            try:
+                save_config(cfg)
+            except Exception as e:
+                log_exception("保存个性化设置")
+                return {"ok": False, "error": f"保存设置失败：{e}"}
+            self._cfg = cfg
+        return {"ok": True, "config": cfg, "message": "背景图已更新"}
+
+    @_guard
+    def clear_personal_image(self):
+        with self._lock:
+            cfg = load_config()
+        folder = os.path.join(BASE_DIR, PERSONAL_DIR_NAME)
+        try:
+            if os.path.isdir(folder):
+                for old in os.listdir(folder):
+                    if old.lower().startswith("bg."):
+                        try:
+                            os.remove(os.path.join(folder, old))
+                        except Exception:
+                            pass
+                try:
+                    os.rmdir(folder)
+                except OSError:
+                    pass
+        except Exception:
+            log_exception("删除背景图片")
+        with self._lock:
+            cfg["personalize_bg"] = ""
+            cfg["personalize_accent"] = ""
+            try:
+                save_config(cfg)
+            except Exception as e:
+                log_exception("保存个性化设置")
+                return {"ok": False, "error": f"保存设置失败：{e}"}
+            self._cfg = cfg
+        return {"ok": True, "config": cfg, "message": "已恢复默认背景"}
 
     @_guard
     def set_tray_style(self, id=None):

@@ -135,6 +135,13 @@ DEFAULTS = {
     "report_dir": REPORT_DIR,
     "max_context_chars": 16000,
     "keep_reports": 200,              # 每个频道最多保留多少份报告
+
+    # ---- 个性化（背景图 + 从图片取色）----
+    "personalize_bg": "",             # 背景图路径（相对程序目录，如 personalize/bg.jpg）
+    "personalize_accent": "",         # 从背景图算出的强调色 #RRGGBB；空 = 默认墨蓝
+    "personalize_blur": 15,           # 信息卡片背后的高斯模糊（px）
+    "personalize_card_alpha": 70,     # 信息卡片白色蒙层浓度（%）
+    "personalize_scrim_alpha": 0,     # 整张背景图的蒙层（%），深色图调高更好读
 }
 
 DEFAULT_STATE = {

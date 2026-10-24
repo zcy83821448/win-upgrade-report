@@ -25,7 +25,7 @@
 
   const PAGE_TITLES = {
     overview: '概览', channels: '更新线', notify: '通知', settings: '设置',
-    startup: '自启与后台', reports: '报告', logs: '日志与诊断'
+    personalize: '个性化', startup: '自启与后台', reports: '报告', logs: '日志与诊断'
   };
 
   /* ---------- 状态 ---------- */
@@ -39,6 +39,8 @@
     selfcheck: null, liveLines: [], liveActive: false, liveRc: null,
     logText: '', logPath: '', logLoaded: false, logLoading: false, logAt: null,
     readerFile: '', readerOpen: false, readerTitle: '', readerToken: 0, pickerOpen: false,
+    personalize: { bg_url: '', accent: '', lum: null, palette: null, blur: 15, card_alpha: 70, scrim_alpha: 0 },
+    cropOpen: false, crop: null,
     foldAdvanced: false, startupTouchedAt: 0, pollTick: 0,
     maximized: false,
     chListHost: null, chDetailHost: null, checkHost: null,
@@ -809,6 +811,9 @@
     state.reports = r.reports || [];
     state.trayStyles = r.tray_styles || [];
     state.detailOptions = r.detail_options || state.detailOptions;
+    state.personalize = Object.assign({
+      bg_url: '', accent: '', lum: null, palette: null, blur: 15, card_alpha: 70, scrim_alpha: 0
+    }, r.personalize || {});
     state.taskText = r.task_text || '';
     state.startup = r.startup || { enabled: false };
     state.now = r.now || '';
@@ -824,6 +829,8 @@
     const boot = $('#boot');
     if (boot) boot.hidden = true;
     updateStatusWidgets();
+    applyPersonalize();
+    refreshPersonalMood();
     go('overview', true);
     pollOnce();
   }
@@ -2675,6 +2682,624 @@
   }
 
   /* ============================================================
+     个性化：第一层清晰图片 / 第二层毛玻璃 / 第三层从图片取色
+     ============================================================ */
+  const PERSONAL_DEFAULTS = { blur: 15, card_alpha: 70, scrim_alpha: 0 };
+
+  function clampNum(n, min, max) { return Math.min(max, Math.max(min, n)); }
+
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    let h = 0, s = 0;
+    if (max !== min) {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h /= 6;
+    }
+    return { h: h * 360, s: s, l: l };
+  }
+
+  function hslToHex(h, s, l) {
+    h = (((h % 360) + 360) % 360) / 360;
+    s = clampNum(s, 0, 1);
+    l = clampNum(l, 0, 1);
+    function hue2rgb(p, q, t) {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+      return p;
+    }
+    let r, g, b;
+    if (s === 0) { r = g = b = l; }
+    else {
+      const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+      const p = 2 * l - q;
+      r = hue2rgb(p, q, h + 1 / 3);
+      g = hue2rgb(p, q, h);
+      b = hue2rgb(p, q, h - 1 / 3);
+    }
+    function toHex(x) {
+      const v = Math.round(clampNum(x, 0, 1) * 255).toString(16);
+      return v.length === 1 ? '0' + v : v;
+    }
+    return '#' + toHex(r) + toHex(g) + toHex(b);
+  }
+
+  function hslToRgb(h, s, l) {
+    const hex = hslToHex(h, s, l);
+    return {
+      r: parseInt(hex.slice(1, 3), 16),
+      g: parseInt(hex.slice(3, 5), 16),
+      b: parseInt(hex.slice(5, 7), 16)
+    };
+  }
+
+  function hexToHsl(hex) {
+    const s = String(hex || '').replace('#', '');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+    const r = parseInt(s.slice(0, 2), 16);
+    const g = parseInt(s.slice(2, 4), 16);
+    const b = parseInt(s.slice(4, 6), 16);
+    return rgbToHsl(r, g, b);
+  }
+
+  /* 取图片平均色 → 略提亮、给一点饱和 → 保证白字可读 */
+  function accentFromDrawable(drawable) {
+    const cv = document.createElement('canvas');
+    cv.width = 48; cv.height = 48;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    let data;
+    try {
+      ctx.drawImage(drawable, 0, 0, 48, 48);
+      data = ctx.getImageData(0, 0, 48, 48).data;
+    } catch (e) {
+      return '';
+    }
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]; g += data[i + 1]; b += data[i + 2]; n++;
+    }
+    if (!n) return '';
+    const hsl = rgbToHsl(r / n, g / n, b / n);
+    let h = hsl.h, s = hsl.s, l = hsl.l;
+    if (s < 0.10) {                 // 灰白图（黑白照、白墙）：退回墨蓝
+      h = 222; s = 0.74; l = 0.48;
+    } else {
+      s = clampNum(s * 1.10 + 0.08, 0.45, 0.88);
+      l = clampNum(l + 0.06, 0.46, 0.56);   // 提亮一点，同时保住白字对比度
+    }
+    return hslToHex(h, s, l);
+  }
+
+  function loadImage(src) {
+    return new Promise(function (resolve, reject) {
+      const img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('图片加载失败')); };
+      img.src = src;
+    });
+  }
+
+  /* 图片分析：
+     - lum：整体亮度（决定深色/浅色主题）
+     - r/g/b：全图平均色（强调色用）
+     - vivid：鲜艳部分的平均色（卡片底色往这儿靠，比平均色更接近“壁纸给人的颜色”） */
+  function imageStats(drawable) {
+    const cv = document.createElement('canvas');
+    cv.width = 32; cv.height = 32;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    let data;
+    try {
+      ctx.drawImage(drawable, 0, 0, 32, 32);
+      data = ctx.getImageData(0, 0, 32, 32).data;
+    } catch (e) {
+      return null;
+    }
+    let r = 0, g = 0, b = 0, n = 0;
+    let vr = 0, vg = 0, vb = 0, vn = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const pr = data[i], pg = data[i + 1], pb = data[i + 2];
+      r += pr; g += pg; b += pb; n++;
+      const hsl = rgbToHsl(pr, pg, pb);
+      if (hsl.s >= 0.45 && hsl.l >= 0.14) { vr += pr; vg += pg; vb += pb; vn++; }
+    }
+    if (!n) return null;
+    r /= n; g /= n; b /= n;
+    const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    let vivid = null;
+    if (vn) { vivid = { r: vr / vn, g: vg / vn, b: vb / vn }; }
+    return { r: r, g: g, b: b, lum: lum, vivid: vivid };
+  }
+
+  function paletteOf(st) {
+    if (!st) return null;
+    return st.vivid || { r: st.r, g: st.g, b: st.b };
+  }
+
+  /* 在「白蒙层+深色字」和「深蒙层+浅色字」两种方案里挑对比度更高的那个；
+     同时把第二层卡片的底色往壁纸的平均色靠（深图深卡片、浅图浅卡片） */
+  function applyTone() {
+    const p = state.personalize || {};
+    const root = document.documentElement;
+    const lum = Number(p.lum);
+    if (!p.bg_url || !isFinite(lum)) {
+      document.body.classList.remove('pg-dark');
+      root.style.setProperty('--pg-scrim-rgb', '246,245,242');
+      root.style.removeProperty('--card-rgb');
+      root.style.removeProperty('--card-line');
+      ['--accent-soft', '--accent-line'].forEach(function (k) { root.style.removeProperty(k); });
+      return;
+    }
+    const a = (Number(p.scrim_alpha) || 0) / 100;
+    const effWhite = lum * (1 - a) + 0.964 * a;   // 白蒙层之后的背景亮度
+    const effDark = lum * (1 - a) + 0.055 * a;    // 深蒙层之后的背景亮度
+    const scoreDarkText = Math.abs(effWhite - 0.10);
+    const scoreLightText = Math.abs(effDark - 0.92);
+    const dark = scoreLightText >= scoreDarkText;
+    document.body.classList.toggle('pg-dark', dark);
+    root.style.setProperty('--pg-scrim-rgb', dark ? '18,17,15' : '246,245,242');
+
+    /* 卡片底色：跟着壁纸平均色走，但保证和文字对比够 */
+    const pal = p.palette || { r: 246, g: 245, b: 242 };
+    const hsl = rgbToHsl(pal.r, pal.g, pal.b);
+    let h = hsl.h, s = hsl.s;
+    if (!isFinite(h) || s < 0.06) { h = 222; s = 0.06; }   // 灰白图：轻微偏冷
+    let rgb, line;
+    if (dark) {
+      // 深色卡片：比背景亮一档，靠浅色描边+内高光把边界亮出来
+      const cardL = clampNum(lum + 0.06, 0.14, 0.26);
+      rgb = hslToRgb(h, clampNum(s * 0.45, 0.10, 0.22), cardL);
+      line = 'rgba(255,255,255,.20)';
+    } else {
+      rgb = hslToRgb(h, clampNum(s * 0.18, 0.02, 0.10), 0.97);
+      line = 'hsl(' + Math.round(h) + ' ' + Math.round(clampNum(s * 0.3, 0.04, 0.22) * 100) + '% 86%)';
+    }
+    root.style.setProperty('--card-rgb', rgb.r + ',' + rgb.g + ',' + rgb.b);
+    root.style.setProperty('--card-line', line);
+
+    /* 强调色的柔和底/描边也要分深浅两套 */
+    const accentHsl = hexToHsl(String(p.accent || ''));
+    if (accentHsl) {
+      if (dark) {
+        const ar = hslToRgb(accentHsl.h, accentHsl.s, 0.5);
+        root.style.setProperty('--accent-soft',
+          'rgba(' + ar.r + ',' + ar.g + ',' + ar.b + ',.18)');
+        root.style.setProperty('--accent-line',
+          'rgba(' + ar.r + ',' + ar.g + ',' + ar.b + ',.45)');
+      } else {
+        root.style.setProperty('--accent-soft',
+          hslToHex(accentHsl.h, Math.max(0.30, accentHsl.s - 0.10), 0.95));
+        root.style.setProperty('--accent-line',
+          hslToHex(accentHsl.h, Math.max(0.28, accentHsl.s - 0.18), 0.85));
+      }
+    }
+  }
+
+  function refreshPersonalMood() {
+    const url = state.personalize && state.personalize.bg_url;
+    if (!url) {
+      state.personalize.lum = null;
+      state.personalize.palette = null;
+      applyTone();
+      return;
+    }
+    loadImage(url).then(function (img) {
+      if (!state.personalize || state.personalize.bg_url !== url) return;
+      const st = imageStats(img);
+      state.personalize.lum = st ? st.lum : null;
+      state.personalize.palette = paletteOf(st);
+      applyTone();
+    }).catch(function () {
+      state.personalize.lum = null;
+      state.personalize.palette = null;
+      applyTone();
+    });
+  }
+
+  function applyPersonalize() {
+    const p = state.personalize || {};
+    const root = document.documentElement;
+    const bg = p.bg_url || '';
+    document.body.classList.toggle('personalized', !!bg);
+    if (bg) root.style.setProperty('--bg-image', "url('" + bg + "')");
+    else root.style.removeProperty('--bg-image');
+
+    const blur = Math.round(Number(p.blur));
+    const veil = Math.round(Number(p.card_alpha));
+    const scrim = Math.round(Number(p.scrim_alpha));
+    root.style.setProperty('--pg-blur', (isFinite(blur) ? blur : PERSONAL_DEFAULTS.blur) + 'px');
+    root.style.setProperty('--card-veil', (isFinite(veil) ? veil : PERSONAL_DEFAULTS.card_alpha) / 100);
+    root.style.setProperty('--scrim-alpha', (isFinite(scrim) ? scrim : PERSONAL_DEFAULTS.scrim_alpha) / 100);
+
+    const accent = String(p.accent || '').trim();
+    const hsl = hexToHsl(accent);
+    if (hsl) {
+      root.style.setProperty('--accent', accent);
+      root.style.setProperty('--accent-top', hslToHex(hsl.h, hsl.s, Math.min(0.64, hsl.l + 0.05)));
+      root.style.setProperty('--accent-strong', hslToHex(hsl.h, hsl.s, Math.max(0.20, hsl.l - 0.08)));
+    } else {
+      ['--accent', '--accent-top', '--accent-strong', '--accent-soft', '--accent-line']
+        .forEach(function (k) { root.style.removeProperty(k); });
+    }
+    applyTone();
+  }
+
+  function personalRangeRow(label, help, key, min, max, step, unit) {
+    const p = state.personalize || {};
+    const cfgKey = 'personalize_' + key;
+    const cur = Number(p[key]);
+    const val = isFinite(cur) ? cur : PERSONAL_DEFAULTS[key];
+    const valEl = el('span', { class: 'range-val', text: val + unit });
+    const input = el('input', {
+      type: 'range', class: 'range', min: String(min), max: String(max),
+      step: String(step), value: String(val), 'aria-label': label
+    });
+    input.addEventListener('input', function () {
+      const v = Number(input.value);
+      valEl.textContent = v + unit;
+      state.personalize[key] = v;
+      applyPersonalize();
+    });
+    input.addEventListener('change', function () {
+      const v = Number(input.value);
+      state.config[cfgKey] = v;
+      queueSave(cfgKey, v);
+    });
+    return el('div', { class: 'range-row' },
+      el('div', { class: 'range-main' },
+        el('div', { class: 'row-label', text: label }),
+        el('div', { class: 'row-help', text: help })
+      ),
+      el('div', { class: 'range-line' }, input, valEl)
+    );
+  }
+
+  function renderPersonalize(host) {
+    const p = state.personalize || {};
+    const hasBg = !!p.bg_url;
+
+    /* ---------- 背景图 ---------- */
+    const preview = el('div', { class: 'pg-preview' + (hasBg ? '' : ' is-empty') });
+    if (hasBg) {
+      preview.append(el('img', { src: p.bg_url, alt: '背景图预览' }));
+      preview.append(el('span', { class: 'pg-badge', text: '当前背景' }));
+    } else {
+      preview.append(el('span', { text: '还没有背景图' }));
+    }
+    const actions = el('div', { class: 'pg-actions' });
+    actions.append(el('button', {
+      type: 'button', class: 'btn btn-primary btn-sm',
+      text: hasBg ? '更换图片' : '上传图片并裁切',
+      onclick: function () { pickPersonalImage(); }
+    }));
+    if (hasBg) {
+      actions.append(el('button', {
+        type: 'button', class: 'btn btn-secondary btn-sm', text: '重新裁切',
+        onclick: function () { openCropModal(state.personalize.bg_url); }
+      }));
+      const rm = el('button', { type: 'button', class: 'btn btn-ghost btn-sm', text: '移除背景' });
+      rm.addEventListener('click', function () { confirmThen(rm, '再点一次移除', removePersonalBg); });
+      actions.append(rm);
+    }
+    const bgCard = el('div', { class: 'card' },
+      el('div', { class: 'pg-row' }, preview,
+        el('div', { class: 'pg-main' },
+          el('div', { class: 'row-label', text: hasBg ? '当前背景图' : '背景图' }),
+          el('div', { class: 'row-help', text: '第一层显示这张图（清晰）；第二层的卡片隔着它做高斯模糊，像毛玻璃。' }),
+          actions,
+          el('div', { class: 'pg-note', text: '图片会复制一份到程序目录，只在本机使用；发布版不包含你的图片。图片偏深时会自动把字换成浅色，偏浅时保持深色。' })
+        )
+      )
+    );
+    host.append(sectionEl('背景图', null, bgCard));
+
+    /* ---------- 效果参数 ---------- */
+    const effectsCard = el('div', { class: 'card' },
+      personalRangeRow('模糊强度', '卡片背后的模糊程度，越大越像毛玻璃', 'blur', 0, 60, 1, ' px'),
+      personalRangeRow('卡片白纱', '卡片白色的浓度，太低文字会看不清', 'card_alpha', 40, 98, 1, ' %'),
+      personalRangeRow('图片蒙层', '整张图上的白色蒙层；图片偏深、偏花时调高更好读', 'scrim_alpha', 0, 70, 1, ' %')
+    );
+    host.append(sectionEl('效果',
+      el('span', { text: hasBg ? '调完立刻生效' : '上传图片后生效' }), effectsCard));
+
+    /* ---------- 强调色 ---------- */
+    const accent = String(p.accent || '');
+    const swatch = el('div', { class: 'swatch', title: accent || '默认墨蓝' });
+    const demo = el('div', { class: 'accent-demo' },
+      el('button', { type: 'button', class: 'btn btn-primary btn-sm', text: '示例按钮' }),
+      el('span', { class: 'switch-demo', 'aria-hidden': 'true' }),
+      el('span', { class: 'tag tag-accent', text: '标签' }),
+      el('span', { class: 'link', text: '示例链接' })
+    );
+    const accentMain = el('div', { class: 'accent-meta' },
+      el('div', { class: 'row-label', text: hasBg ? '来自图片的平均色' : '默认强调色' }),
+      el('div', {
+        class: 'row-help',
+        text: '取整张图的平均色，自动提亮到适合白字的深度；按钮用一个很轻的上下渐变。'
+      }),
+      el('div', { class: 'mono', text: accent || '#1F5AE0（默认墨蓝）' })
+    );
+    const accentCard = el('div', { class: 'card' },
+      el('div', { class: 'accent-preview' }, swatch, accentMain),
+      demo,
+      hasBg ? el('div', { class: 'pg-actions' },
+        el('button', {
+          type: 'button', class: 'btn btn-secondary btn-sm', text: '从图片重新取色',
+          onclick: function () { recomputeAccent(); }
+        })
+      ) : null
+    );
+    host.append(sectionEl('强调色',
+      el('span', { text: hasBg ? '跟着图片走' : '上传图片后自动取色' }), accentCard));
+
+    /* ---------- 恢复默认 ---------- */
+    const resetBtn = el('button', {
+      type: 'button', class: 'btn btn-secondary btn-sm', text: '恢复默认外观'
+    });
+    resetBtn.addEventListener('click', function () {
+      confirmThen(resetBtn, '再点一次恢复', resetPersonalize);
+    });
+    const resetCard = el('div', { class: 'card' },
+      el('div', { class: 'settings-row' },
+        el('div', { class: 'settings-main' },
+          el('div', { class: 'row-label', text: '恢复默认外观' }),
+          el('div', { class: 'row-help', text: '移除背景图，模糊/白纱/蒙层都回到默认值，界面变回现在这样。' })
+        ),
+        el('div', { class: 'settings-ctl' }, resetBtn)
+      )
+    );
+    host.append(sectionEl('恢复默认', null, resetCard));
+  }
+
+  /* ---------- 上传 / 裁切 ---------- */
+  async function pickPersonalImage() {
+    const r = await callApi('pick_personal_image', [], { failText: '没能打开选图窗口' });
+    if (!r || !r.ok || r.cancelled) return;
+    openCropModal(r.data_url);
+  }
+
+  function ensureCropModal() {
+    let root = $('#cropModal');
+    if (root) return root;
+    const box = el('div', { class: 'crop-box', id: 'cropBox' },
+      el('span', { class: 'crop-h', 'data-dir': 'nw' }),
+      el('span', { class: 'crop-h', 'data-dir': 'ne' }),
+      el('span', { class: 'crop-h', 'data-dir': 'sw' }),
+      el('span', { class: 'crop-h', 'data-dir': 'se' })
+    );
+    const frame = el('div', { class: 'crop-frame', id: 'cropFrame' },
+      el('img', { id: 'cropImg', alt: '背景图预览' }), box);
+    const panel = el('div', {
+      class: 'crop-panel', role: 'dialog', 'aria-modal': 'true',
+      'aria-labelledby': 'cropTitle', tabindex: '-1'
+    },
+      el('div', { class: 'crop-bar' },
+        el('div', { class: 'crop-title', id: 'cropTitle', text: '裁切背景图' }),
+        el('button', {
+          type: 'button', class: 'icon-btn', title: '关闭（Esc）', 'aria-label': '关闭',
+          onclick: function () { closeCropModal(); }
+        }, svgIcon('x'))
+      ),
+      el('div', { class: 'crop-stage' }, frame),
+      el('div', { class: 'crop-foot' },
+        el('div', { class: 'crop-hint', text: '拖动方框选择要显示的区域；背景会自动铺满整个窗口。' }),
+        el('div', { class: 'crop-actions' },
+          el('button', {
+            type: 'button', class: 'btn btn-secondary btn-sm', text: '全图',
+            onclick: function () { resetCropBox(); }
+          }),
+          el('button', {
+            type: 'button', class: 'btn btn-ghost btn-sm', text: '取消',
+            onclick: function () { closeCropModal(); }
+          }),
+          el('button', {
+            type: 'button', class: 'btn btn-primary btn-sm', text: '使用这张',
+            onclick: function () { confirmCrop(); }
+          })
+        )
+      )
+    );
+    root = el('div', { class: 'crop', id: 'cropModal', hidden: true }, panel);
+    root.addEventListener('click', function (e) { if (e.target === root) closeCropModal(); });
+    box.addEventListener('pointerdown', cropPointerDown);
+    document.body.append(root);
+    return root;
+  }
+
+  function placeCropBox() {
+    const c = state.crop;
+    const box = $('#cropBox');
+    if (!c || !box) return;
+    box.style.left = c.box.x + 'px';
+    box.style.top = c.box.y + 'px';
+    box.style.width = c.box.w + 'px';
+    box.style.height = c.box.h + 'px';
+  }
+
+  function resetCropBox() {
+    const c = state.crop;
+    if (!c) return;
+    c.box = { x: 0, y: 0, w: c.dispW, h: c.dispH };
+    placeCropBox();
+  }
+
+  function cropPointerDown(e) {
+    if (!state.crop) return;
+    e.preventDefault();
+    const dir = (e.target && e.target.dataset && e.target.dataset.dir) || 'move';
+    const startX = e.clientX, startY = e.clientY;
+    const b0 = Object.assign({}, state.crop.box);
+    const W = state.crop.dispW, H = state.crop.dispH;
+    const MIN = 32;
+    function onMove(ev) {
+      const dx = ev.clientX - startX, dy = ev.clientY - startY;
+      let x = b0.x, y = b0.y, w = b0.w, h = b0.h;
+      if (dir === 'move') {
+        x = clampNum(b0.x + dx, 0, W - b0.w);
+        y = clampNum(b0.y + dy, 0, H - b0.h);
+      } else {
+        if (dir.indexOf('w') >= 0) {
+          const nx = clampNum(b0.x + dx, 0, b0.x + b0.w - MIN);
+          w = b0.x + b0.w - nx; x = nx;
+        }
+        if (dir.indexOf('e') >= 0) w = clampNum(b0.w + dx, MIN, W - b0.x);
+        if (dir.indexOf('n') >= 0) {
+          const ny = clampNum(b0.y + dy, 0, b0.y + b0.h - MIN);
+          h = b0.y + b0.h - ny; y = ny;
+        }
+        if (dir.indexOf('s') >= 0) h = clampNum(b0.h + dy, MIN, H - b0.y);
+      }
+      state.crop.box = { x: x, y: y, w: w, h: h };
+      placeCropBox();
+    }
+    function onUp() {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    }
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  }
+
+  function openCropModal(dataUrl) {
+    if (!dataUrl) return;
+    const root = ensureCropModal();
+    root.hidden = false;
+    state.cropOpen = true;
+    state.lastFocus = document.activeElement;
+    const panel = root.querySelector('.crop-panel');
+    if (panel && panel.focus) panel.focus();
+    const img = $('#cropImg');
+    const frame = $('#cropFrame');
+    img.onload = function () {
+      const nw = img.naturalWidth || 1, nh = img.naturalHeight || 1;
+      const maxW = Math.min(window.innerWidth * 0.82, 1000);
+      const maxH = Math.min(window.innerHeight * 0.62, 620);
+      const k = Math.min(maxW / nw, maxH / nh, 1);
+      const dw = Math.max(60, Math.round(nw * k));
+      const dh = Math.max(60, Math.round(nh * k));
+      frame.style.width = dw + 'px';
+      frame.style.height = dh + 'px';
+      state.crop = {
+        img: img, nw: nw, nh: nh, dispW: dw, dispH: dh,
+        scale: dw / nw, box: { x: 0, y: 0, w: dw, h: dh }
+      };
+      placeCropBox();
+    };
+    img.onerror = function () {
+      closeCropModal();
+      toast('error', '这张图片读不出来，换一张试试');
+    };
+    img.src = dataUrl;
+  }
+
+  function closeCropModal() {
+    const root = $('#cropModal');
+    if (!root || root.hidden) return;
+    root.hidden = true;
+    state.cropOpen = false;
+    state.crop = null;
+    if (state.lastFocus && state.lastFocus.isConnected) {
+      try { state.lastFocus.focus(); } catch (e) { /* 焦点回不去就算了 */ }
+    }
+  }
+
+  async function confirmCrop() {
+    const c = state.crop;
+    if (!c || !c.img) return;
+    const sx = c.box.x / c.scale, sy = c.box.y / c.scale;
+    const sw = Math.max(1, c.box.w / c.scale);
+    const sh = Math.max(1, c.box.h / c.scale);
+    const MAXDIM = 1920;
+    const k = Math.min(1, MAXDIM / Math.max(sw, sh));
+    const cw = Math.max(1, Math.round(sw * k));
+    const ch = Math.max(1, Math.round(sh * k));
+    const cv = document.createElement('canvas');
+    cv.width = cw; cv.height = ch;
+    const ctx = cv.getContext('2d');
+    let dataUrl = '';
+    try {
+      ctx.drawImage(c.img, sx, sy, sw, sh, 0, 0, cw, ch);
+      dataUrl = cv.toDataURL('image/jpeg', 0.9);
+    } catch (e) {
+      toast('error', '这张图片处理不了，换一张试试');
+      return;
+    }
+    if (!dataUrl) { toast('error', '裁切失败了，再试一次'); return; }
+    const accent = accentFromDrawable(cv);
+    const stats = imageStats(cv);
+    closeCropModal();
+    const r = await callApi('save_personal_image', [dataUrl, accent],
+      { failText: '没能保存背景图' });
+    if (!r || !r.ok) return;
+    if (r.config) state.config = r.config;
+    state.personalize = Object.assign({}, state.personalize,
+      { bg_url: dataUrl, accent: accent,
+        lum: stats ? stats.lum : null,
+        palette: paletteOf(stats) });
+    applyPersonalize();
+    refreshPage();
+  }
+
+  async function removePersonalBg() {
+    const r = await callApi('clear_personal_image', [], { failText: '没能移除背景' });
+    if (!r || !r.ok) return;
+    if (r.config) state.config = r.config;
+    state.personalize = Object.assign({}, state.personalize,
+      { bg_url: '', accent: '', lum: null, palette: null });
+    applyPersonalize();
+    refreshPage();
+  }
+
+  async function recomputeAccent() {
+    const url = state.personalize && state.personalize.bg_url;
+    if (!url) return;
+    let img;
+    try { img = await loadImage(url); } catch (e) { toast('error', '图片读不出来'); return; }
+    const accent = accentFromDrawable(img);
+    if (!accent) { toast('error', '取色失败，换一张试试'); return; }
+    const stats = imageStats(img);
+    state.personalize = Object.assign({}, state.personalize,
+      { accent: accent,
+        lum: stats ? stats.lum : null,
+        palette: paletteOf(stats) });
+    state.config.personalize_accent = accent;
+    applyPersonalize();
+    queueSave('personalize_accent', accent);
+    refreshPage();
+    toast('ok', '已从图片重新取色');
+  }
+
+  async function resetPersonalize() {
+    const a = bridge();
+    if (!a) return;
+    try {
+      await a.save_config({
+        personalize_blur: PERSONAL_DEFAULTS.blur,
+        personalize_card_alpha: PERSONAL_DEFAULTS.card_alpha,
+        personalize_scrim_alpha: PERSONAL_DEFAULTS.scrim_alpha
+      });
+    } catch (e) { noteErr(e); }
+    const r = await callApi('clear_personal_image', [], { failText: '没能恢复默认' });
+    if (!r || !r.ok) return;
+    if (r.config) state.config = r.config;
+    state.personalize = {
+      bg_url: '', accent: '', lum: null, palette: null,
+      blur: PERSONAL_DEFAULTS.blur,
+      card_alpha: PERSONAL_DEFAULTS.card_alpha,
+      scrim_alpha: PERSONAL_DEFAULTS.scrim_alpha
+    };
+    applyPersonalize();
+    refreshPage();
+  }
+
+  /* ============================================================
      渲染入口表
      ============================================================ */
   const RENDERERS = {
@@ -2682,6 +3307,7 @@
     channels: renderChannels,
     notify: renderNotify,
     settings: renderSettings,
+    personalize: renderPersonalize,
     startup: renderStartup,
     reports: renderReports,
     logs: renderLogs
@@ -2692,6 +3318,7 @@
      ============================================================ */
   function onKeydown(e) {
     if (e.key === 'Escape') {
+      if (state.cropOpen) { e.preventDefault(); closeCropModal(); return; }
       if (state.pickerOpen) { e.preventDefault(); closePicker(); return; }
       if (state.readerOpen) { e.preventDefault(); closeReader(); return; }
       dismissLastToast();

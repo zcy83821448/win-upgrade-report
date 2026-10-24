@@ -6,6 +6,9 @@ state.json
 logs/
 reports/
 
+# 用户上传的背景图（个性化）
+personalize/
+
 # 构建产物
 __pycache__/
 *.pyc
