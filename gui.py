@@ -34,6 +34,7 @@ import mdlite                                                               # no
 import deepseek_api                                                         # noqa: E402
 import tray as tray_mod                                                     # noqa: E402
 import selfcheck                                                            # noqa: E402
+import hotwin                                                               # noqa: E402
 
 WATCH_TASK_NAME = "WinUpdReport_Watch"
 DAILY_TASK_NAME = "WinUpdReport_Daily"     # 旧版每日任务；装哨兵时顺手卸掉
@@ -515,6 +516,8 @@ def _win32():
             u.IsWindow.argtypes = [ctypes.c_void_p]
             u.IsIconic.argtypes = [ctypes.c_void_p]
             u.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            u.BringWindowToTop.argtypes = [ctypes.c_void_p]
             u.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
             u.FindWindowW.restype = ctypes.c_void_p
             u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
@@ -590,6 +593,8 @@ class GuiApi:
         self._resize_alive = False
         self._reload_rows()
         self._query_task_info_async()
+        # 只用来响应“重复启动时把已有窗口提到前台”，不常驻任何 WebView
+        self._show_event = None
 
     # ============================================================ 初始数据
 
@@ -1476,7 +1481,7 @@ class GuiApi:
 
     @_guard
     def window_close(self):
-        """只关窗口：后台哨兵是独立进程，照旧跑。"""
+        """只关窗口：后台哨兵是独立进程，照旧跑。窗口进程一起退出，不常驻。"""
         self._schedule_destroy()
         return {"ok": True}
 
@@ -1647,6 +1652,48 @@ class GuiApi:
         u.SetWindowPos(ctypes.c_void_p(hwnd), None, int(x), int(y),
                        phys_w, phys_h, SWP_NOZORDER | SWP_NOACTIVATE)
         return True
+
+    # ------------------------------------------------- 重复启动时提到前台
+    # 不再隐藏待命：窗口关掉进程就退出，空闲时只有后台哨兵一个进程。
+    # 这里只留一个很轻的监听线程：用户双击 exe 时，第二个进程会发事件，
+    # 已有窗口把它提到前台（不会开第二个 WebView）。
+
+    def start_show_watcher(self):
+        self._show_event = hotwin.create_event(hotwin.GUI_SHOW_EVENT)
+        threading.Thread(target=self._show_loop, daemon=True,
+                         name="gui-show").start()
+
+    def _show_loop(self):
+        while True:
+            if hotwin.wait_event(self._show_event, 500):
+                self._present_window()
+
+    def _present_window(self):
+        """把已有窗口提到前台（重复启动 / 再点托盘时用）。"""
+        window = self._window
+        if window is None:
+            return
+        try:
+            hwnd = self._hwnd()
+        except Exception:
+            hwnd = 0
+        try:
+            u, _d = _win32()
+            if hwnd and u.IsIconic(ctypes.c_void_p(hwnd)):
+                u.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+            window.show()
+            if hwnd:
+                u.BringWindowToTop(ctypes.c_void_p(hwnd))
+                u.SetForegroundWindow(ctypes.c_void_p(hwnd))
+        except Exception:
+            log_exception("把窗口提到前台")
+
+    def _close_show_handle(self):
+        with self._lock:
+            handle = self._show_event
+            if handle:
+                hotwin.close_handle(handle)
+                self._show_event = None
 
     def _schedule_destroy(self):
         """先让 JS 拿到返回值，再关窗口；关窗 = 进程退出（后台哨兵是独立进程）。"""
@@ -2225,47 +2272,66 @@ class GuiApi:
 # ================================================================== 入口
 
 def main():
-    """起一个 frameless 原生窗口（WebView2），标题栏由页面自己画。"""
-    import webview                      # 放在函数里：import gui 时不加载界面依赖
+    """起一个 frameless 原生窗口（WebView2），标题栏由页面自己画。
 
-    api = GuiApi()
-    index_path = resource_path(os.path.join("webui", "index.html"))
-    if not os.path.exists(index_path):
-        write_error_line(f"界面文件不存在：{index_path}")
-    window = webview.create_window(
-        APP_TITLE,
-        url=index_path,
-        js_api=api,
-        width=WINDOW_W,
-        height=WINDOW_H,
-        min_size=(960, 640),
-        frameless=True,                 # 不要原生标题栏/边框，标题栏由页面自绘
-        easy_drag=False,                # 整窗任意位置都能拖会很难用，只让标题栏拖
-        shadow=True,                    # 保留 DWM 阴影（pywebview 会开）
-        background_color="#F6F5F2",
-        text_select=True,
-    )
-    api._window = window
+    窗口进程不常驻：关掉窗口就退出，空闲时只留后台哨兵一个进程（约 55MB）。
+    重复启动（双击两下 / 托盘再点）只会把已有窗口提到前台，不会开第二个。
+    """
+    # ★ 先抢互斥体再 import webview：重复启动（双击两下 / 托盘连点）时，
+    #   后一个进程几十毫秒就能退出，不会真去建第二个 WebView2。
+    mutex, already = hotwin.create_mutex(hotwin.GUI_MUTEX)
+    if already:
+        hotwin.signal_gui_show()
+        hotwin.close_handle(mutex)
+        return 0
 
-    def on_shown():
-        # 窗口真正出现后才有句柄：开 Win11 圆角（Win10 会失败，忽略即可），
-        # 并把被 frameless 缩掉的尺寸补回设计值。
-        try:
-            api._apply_corner(DWMWCP_ROUND)
-        except Exception:
-            log_exception("设置窗口圆角")
-        try:
-            api._fix_initial_size(WINDOW_W, WINDOW_H)
-        except Exception:
-            log_exception("校正窗口初始尺寸")
-
+    api = None
     try:
-        window.events.shown += on_shown
-    except Exception:
-        pass
-    icon = resource_path("icon.ico")
-    webview.start(gui="edgechromium", private_mode=True,
-                  icon=icon if os.path.exists(icon) else None)
+        import webview                      # 放在函数里：import gui 时不加载界面依赖
+
+        api = GuiApi()
+        index_path = resource_path(os.path.join("webui", "index.html"))
+        if not os.path.exists(index_path):
+            write_error_line(f"界面文件不存在：{index_path}")
+        window = webview.create_window(
+            APP_TITLE,
+            url=index_path,
+            js_api=api,
+            width=WINDOW_W,
+            height=WINDOW_H,
+            min_size=(960, 640),
+            frameless=True,                 # 不要原生标题栏/边框，标题栏由页面自绘
+            easy_drag=False,                # 整窗任意位置都能拖会很难用，只让标题栏拖
+            shadow=True,                    # 保留 DWM 阴影（pywebview 会开）
+            background_color="#F6F5F2",
+            text_select=True,
+        )
+        api._window = window
+        api.start_show_watcher()
+
+        def on_shown():
+            # 窗口真正出现后才有句柄：开 Win11 圆角（Win10 会失败，忽略即可），
+            # 并把被 frameless 缩掉的尺寸补回设计值。
+            try:
+                api._apply_corner(DWMWCP_ROUND)
+            except Exception:
+                log_exception("设置窗口圆角")
+            try:
+                api._fix_initial_size(WINDOW_W, WINDOW_H)
+            except Exception:
+                log_exception("校正窗口初始尺寸")
+
+        try:
+            window.events.shown += on_shown
+        except Exception:
+            pass
+        icon = resource_path("icon.ico")
+        webview.start(gui="edgechromium", private_mode=True,
+                      icon=icon if os.path.exists(icon) else None)
+    finally:
+        if api is not None:
+            api._close_show_handle()
+        hotwin.close_handle(mutex)
     return 0
 
 

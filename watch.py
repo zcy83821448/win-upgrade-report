@@ -52,6 +52,7 @@ import source                                                         # noqa: E4
 import gamesense                                                      # noqa: E402
 import checker                                                        # noqa: E402
 import tray as tray_mod                                               # noqa: E402
+import hotwin                                                        # noqa: E402
 
 VERBOSE = "--verbose" in sys.argv
 ONCE = "--once" in sys.argv
@@ -70,6 +71,10 @@ STATE = {"mode": "normal", "last_check": "", "game_exe": "",
 # 托盘实例。菜单动作（比如「设置界面没起来」时弹个气泡）要用到它，
 # 所以放在模块级；没挂托盘时就是 None。
 TRAY = None
+
+# 重复启动设置界面时，用它把已有窗口提到前台（见 hotwin.py）。
+_GUI_SHOW = None
+_LAST_OPEN = 0.0
 
 
 def say(msg, level="INFO"):
@@ -201,12 +206,40 @@ def _verify_settings_opened():
     return False
 
 
-def open_settings():
-    """从托盘打开设置界面（打包后就是再跑一次自己，不带参数）。"""
+def _init_gui_ipc():
+    """建一个命名事件并一直拿着。
+
+    设置界面正常是自己创建的；哨兵先建好，界面启动时能直接复用。
+    事件只在「再点一次托盘 / 重复双击 exe」时用，不占内存。
+    """
+    global _GUI_SHOW
+    _GUI_SHOW = hotwin.create_event(hotwin.GUI_SHOW_EVENT)
+
+
+def _gui_cmd():
     if is_frozen():
-        ok = _spawn([sys.executable])
-    else:
-        ok = _spawn([_pythonw(), os.path.join(BASE_DIR, "gui.py")])
+        return [sys.executable]
+    return [_pythonw(), os.path.join(BASE_DIR, "gui.py")]
+
+
+def open_settings():
+    """从托盘打开设置界面。
+
+    窗口已经开着 → 只发一个事件，把它提到前台（不会开第二个 WebView）。
+    没有窗口 → 启动一个；窗口进程关掉就退出，不常驻后台。
+    """
+    global _LAST_OPEN
+    if hotwin.gui_alive():
+        hotwin.signal_gui_show()
+        return True
+
+    now = time.monotonic()
+    # 托盘一次点击可能同时来 NIN_SELECT 和鼠标消息，0.8 秒内只启动一次
+    if now - _LAST_OPEN < 0.8:
+        return True
+    _LAST_OPEN = now
+
+    ok = _spawn(_gui_cmd())
     if ok:
         threading.Thread(target=_verify_settings_opened, daemon=True).start()
     return ok
@@ -400,6 +433,7 @@ def main():
     tray = None
     tray_style = ""
     if not NO_TRAY:
+        _init_gui_ipc()            # 事件先建好，GUI 还没起来时的点击也不会丢
         # 托盘图标样式：icons\ 下有 9 套（线条粗细 × 箭头占位大小），用户在设置
         # 界面里随便挑。哨兵每轮都会重读配置，所以换样式是现场换图标，不用重启。
         # 程序自己的 icon.ico 一直不变：它要出现在资源管理器里，浅色背景上
@@ -618,6 +652,8 @@ def main():
                     pass
                 time.sleep(10)
     finally:
+        # 哨兵要走了：让还藏在后台的设置窗口也退掉（窗口正开着的话保持不动，
+        # 用户还能把这次操作做完；GUI 那边会看到哨兵没了，关窗时自动退出）。
         if tray is not None:
             tray.stop()
             say("托盘图标已移除")
@@ -632,6 +668,8 @@ def main():
             save_watch(w)
         except Exception:
             pass
+        # 句柄不用显式关：进程马上退出，系统会回收；提前关反而可能
+        # 让刚启动的 GUI 重新创建一个没收到退出信号的事件。
 
     return 0
 

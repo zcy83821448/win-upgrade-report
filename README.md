@@ -40,11 +40,10 @@ Edge WebView2 Runtime。
 
 数据（`config.json`、报告、日志）就存在这个文件夹里，所以整个文件夹可以直接拷到别的电脑接着用。
 
-> **为什么是文件夹而不是一个 exe**：单文件版每次启动都要把自己解压到 `%TEMP%\_MEIxxxx`，
-> 启动慢（2 秒），而且容易被临时文件清理工具、杀毒软件干扰，冒出
-> `Failed to start embedded python interpreter` / `Failed to remove temporary directory`
-> 这类看不懂的报错。文件夹版没有解压这一步 —— 启动 0.2 秒，整类问题从根上不存在。
-> Releases 里也提供单文件版（`*-single.exe`）备用。
+> **为什么是文件夹而不是一个 exe**：把整个程序压成一个 exe 的话，每次启动都要
+> 先解压到 `%TEMP%\_MEIxxxx`，启动慢，而且容易被临时文件清理工具、杀毒软件干扰，
+> 冒出 `Failed to start embedded python interpreter` / `Failed to remove temporary directory`
+> 这类看不懂的报错。文件夹版没有解压这一步，整类问题从根上不存在。
 
 想让它在后台一直盯着：进「自启与后台」页点「一键设置开机自启」（免管理员权限），
 或者点「安装 / 更新计划任务」用计划任务（更稳，崩了会自动重启，但要弹一次 UAC）。
@@ -236,7 +235,6 @@ AI 只在「确认出现新版本」之后被调用一次，而且同一个版�
     webui\                     设置界面（HTML / CSS / JS，原生窗口里渲染）
     使用说明.txt
     config.json / state.json / reports\ / logs\   你的数据（首次运行后出现）
-  单文件版（备用）\            旧版单文件 exe，应急用
   绿色版.zip                  发布用压缩包（不含你的 Key 和历史数据）
 ```
 

@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-"""打包成「绿色文件夹版」（默认）或「单文件版」（可选）。
+"""打包成「绿色文件夹版」。
 
-    python 打包.py                打绿色文件夹版（推荐）—— 默认就是这个
+    python 打包.py                打绿色文件夹版
     python 打包.py --zip          顺带压成一个可直接发布的 zip
-    python 打包.py --onefile      打单文件版（备用）
     python 打包.py --verify       打完顺便跑一次自检
 
-为什么默认改成绿色文件夹版
-    单文件 exe 每次启动都要把自己解包到 %TEMP%\\_MEIxxxx，由此带来一串
-    和临时目录有关的怪问题（解包失败、删不掉、子进程复用了别人的目录……），
-    而且启动要 2 秒。绿色文件夹版没有解包这一步：
-      * 启动只要 0.2 秒
+为什么是绿色文件夹版
+    程序要带 Python 运行时、pythonnet 和 WebView2 桥，单独一个 exe 每次
+    启动都得先解压到 %TEMP%\\_MEIxxxx，慢，而且容易被临时文件清理工具、
+    杀毒软件干扰。绿色文件夹版没有解包这一步：
+      * 启动更快（冷启动约 1 秒，托盘再打开是毫秒级）
       * 完全没有临时目录，整类问题从根上不存在
       * 托盘图标的路径也是固定的（图标"显示/隐藏"设置不会每次启动就作废）
     代价是得到一个文件夹而不是一个文件，压缩成 zip 发布即可。
@@ -18,8 +17,7 @@
 打包出来的东西
     绿色版：应用程序\\win升级报告\\             整个文件夹（里面是 exe + _internal）
             应用程序\\win升级报告\\使用说明.txt
-            应用程序\\win升级报告-v2.3-绿色版.zip   （加 --zip 才有）
-    单文件：应用程序\\win升级报告.exe
+            应用程序\\win升级报告-绿色版.zip       （加 --zip 才有）
 
 数据（config.json / state.json / reports / logs）放在 exe 同目录 —— 也就是绿色文件夹里，
 所以整包可以拷走、解压即用。
@@ -34,16 +32,27 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.join(BASE, "应用程序")
 BUILD_DIR = os.path.join(BASE, "build")
 EXE_NAME = "win升级报告"
-ONEFILE = "--onefile" in sys.argv          # 默认绿色文件夹版；要单文件才加这个开关
 GREEN_DIR = os.path.join(APP_DIR, EXE_NAME)                 # 绿色版整个文件夹
 ZIP_PATH = os.path.join(APP_DIR, f"{EXE_NAME}-绿色版.zip")   # 发布用的 zip
 HIDDEN = ["gui", "checker", "viewer", "reporter", "source", "deepseek_api",
           "notify", "channels", "config", "mdlite", "app", "watch", "gamesense",
-          "tray", "selfcheck",
+          "tray", "selfcheck", "hotwin",
           # 界面层：pywebview（WebView2 原生窗口）。平台模块是运行时动态导入的，
           # PyInstaller 静态分析看不到，必须显式写出来；clr 是 pythonnet 的入口。
           "webview", "webview.platforms.winforms", "webview.platforms.win32",
           "webview.http", "clr", "clr_loader"]
+# 用不到的模块一律别打进来。PyInstaller 会把 pywebview 里所有平台的
+# import 都分析一遍，环境里装了 PyQt5 就会把 47MB 的 Qt 拖进安装包；
+# win32com/Pythonwin 也是只在老代码里用过、现在完全没用的东西。
+# 这些文件不会在启动时 import，但它们会让杀毒软件每次启动多扫几十 MB。
+EXCLUDES = [
+    "PyQt5", "sip", "qtpy",
+    "webview.platforms.qt", "webview.platforms.gtk",
+    "webview.platforms.cocoa", "webview.platforms.android",
+    "webview.platforms.cef", "webview.platforms.mshtml",
+    "win32com", "pywin", "Pythonwin", "win32ui", "win32api",
+    "pythoncom", "pywintypes", "tkinter", "_tkinter",
+]
 DATA = ["toast.ps1", "task.ps1", "icon.ico", "tray.ico"]
 DATA_DIRS = ["icons", "webui"]   # icons: 托盘图标样式；webui: 设置界面的 HTML/CSS/JS
 
@@ -65,9 +74,9 @@ README_TXT = """win升级报告
 Win10/11 一般自带；老机器缺了会提示装一下 Edge WebView2 Runtime。
 后台哨兵不依赖它，只有设置窗口需要。
 
-为什么是文件夹而不是一个 exe：单文件版每次启动都要把自己解压到临时目录，
-启动慢（2 秒），而且容易被临时文件清理工具、杀毒软件干扰，冒出一些
-莫名其妙的报错。文件夹版没有这一步 —— 启动 0.2 秒，也没有临时目录可以出问题。
+为什么是文件夹：程序要带 Python 运行时和 WebView2 的 .NET 桥，做成单个 exe
+的话每次启动都得先解压到临时目录，慢，而且容易被杀毒软件、清理工具干扰。
+文件夹版没有这一步，启动更快，也没有临时目录可以出问题。
 
 文件夹里其它东西（_internal、webui 等）是程序运行需要的，别删；
 也别把 exe 单独拖出来，那样它找不到自己的零件。
@@ -276,7 +285,7 @@ def main():
             return 2
 
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
-           "--onefile" if ONEFILE else "--onedir", "--noconsole",
+           "--onedir", "--noconsole",
            "--name", EXE_NAME,
            "--icon", os.path.join(BASE, "icon.ico"),
            "--distpath", APP_DIR,
@@ -285,6 +294,8 @@ def main():
            "--log-level", "WARN"]
     for n in HIDDEN:
         cmd += ["--hidden-import", n]
+    for n in EXCLUDES:
+        cmd += ["--exclude-module", n]
     for d in DATA:
         cmd += ["--add-data", f"{os.path.join(BASE, d)};."]
     for d in DATA_DIRS:
@@ -293,55 +304,39 @@ def main():
 
     # 绿色文件夹版里可能有用户自己的 config.json / 历史报告 / 日志。
     # PyInstaller 会整个清掉目标目录，所以先备份、打包后原样放回。
-    bak, kept = ("", [])
-    if not ONEFILE:
-        bak, kept = _backup_user_data()
+    bak, kept = _backup_user_data()
 
     try:
         rc = run(cmd, cwd=BASE)
     finally:
-        if not ONEFILE and bak:
+        if bak:
             _restore_user_data(bak, kept)
     if rc != 0:
         print("PyInstaller 失败，退出码", rc)
         return rc
 
-    if ONEFILE:
-        # ---------------- 单文件版（备用方案）----------------
-        exe = os.path.join(APP_DIR, EXE_NAME + ".exe")
-        if not os.path.exists(exe):
-            print("没找到产物:", exe)
-            return 3
-        size = os.path.getsize(exe) / 1024 / 1024
-        print(f"\n打包完成（单文件版）: {exe}  ({size:.1f} MB)")
-        with open(os.path.join(APP_DIR, "使用说明.txt"), "w",
-                  encoding="utf-8") as f:
-            f.write(README_TXT)
-        print("已写使用说明.txt")
-    else:
-        # ---------------- 绿色文件夹版（推荐）----------------
-        exe = os.path.join(GREEN_DIR, EXE_NAME + ".exe")
-        if not os.path.exists(exe):
-            print("没找到产物:", exe)
-            return 3
-        total = sum(os.path.getsize(os.path.join(r, f))
-                    for r, _d, fs in os.walk(GREEN_DIR) for f in fs)
-        print(f"\n打包完成（绿色文件夹版）: {GREEN_DIR}")
-        print(f"  文件夹总大小 {total / 1024 / 1024:.1f} MB"
-              f"　（启动不需要解包，所以比单文件版更快）")
+    # ---------------- 绿色文件夹版 ----------------
+    exe = os.path.join(GREEN_DIR, EXE_NAME + ".exe")
+    if not os.path.exists(exe):
+        print("没找到产物:", exe)
+        return 3
+    total = sum(os.path.getsize(os.path.join(r, f))
+                for r, _d, fs in os.walk(GREEN_DIR) for f in fs)
+    print(f"\n打包完成（绿色文件夹版）: {GREEN_DIR}")
+    print(f"  文件夹总大小 {total / 1024 / 1024:.1f} MB（启动不需要解包）")
 
-        # 说明文件放进文件夹里，解压出来就是一个自解释的目录
-        with open(os.path.join(GREEN_DIR, "使用说明.txt"), "w",
-                  encoding="utf-8") as f:
-            f.write(README_TXT)
-        print("已写 使用说明.txt")
-        # 注意：_internal 里的东西一个都别删。base_library.zip 是 Python 标准库，
-        # 删了程序直接跑不起来（别问怎么知道的）。
+    # 说明文件放进文件夹里，解压出来就是一个自解释的目录
+    with open(os.path.join(GREEN_DIR, "使用说明.txt"), "w",
+              encoding="utf-8") as f:
+        f.write(README_TXT)
+    print("已写 使用说明.txt")
+    # 注意：_internal 里的东西一个都别删。base_library.zip 是 Python 标准库，
+    # 删了程序直接跑不起来（别问怎么知道的）。
 
-        if "--zip" in sys.argv:
-            zp = make_zip(GREEN_DIR, ZIP_PATH, EXE_NAME, exclude=KEEP_DATA)
-            print(f"已打包发布用的 zip: {zp}"
-                  f"  ({os.path.getsize(zp) / 1024 / 1024:.1f} MB)")
+    if "--zip" in sys.argv:
+        zp = make_zip(GREEN_DIR, ZIP_PATH, EXE_NAME, exclude=KEEP_DATA)
+        print(f"已打包发布用的 zip: {zp}"
+              f"  ({os.path.getsize(zp) / 1024 / 1024:.1f} MB)")
 
     print("\n【这台机器怎么用】装完直接双击 exe 就打开设置窗口；")
     print("想让它在后台一直盯着，进「自启与后台」页点「一键设置开机自启」。")

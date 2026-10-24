@@ -44,6 +44,11 @@ NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO, NIF_SHOWTIP = 0x01, 0x02, 0x04, 0x10, 
 NOTIFYICON_VERSION_4 = 4
 
 WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x0202, 0x0203, 0x0205
+WM_CONTEXTMENU = 0x007B
+# NOTIFYICON_VERSION_4 下，鼠标事件改用下面这些通知码（老版本是 WM_* 鼠标消息）
+NIN_SELECT, NIN_KEYSELECT = 0x0400, 0x0401
+_OPEN_EVENTS = (WM_LBUTTONUP, WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT)
+_MENU_EVENTS = (WM_RBUTTONUP, WM_CONTEXTMENU)
 WM_DESTROY, WM_NULL = 0x0002, 0x0000
 MF_STRING, MF_SEPARATOR, MF_GRAYED, MF_CHECKED = 0x0, 0x800, 0x1, 0x8
 TPM_RIGHTBUTTON, TPM_RETURNCMD, TPM_NONOTIFY = 0x0002, 0x0100, 0x0080
@@ -374,11 +379,13 @@ class Tray:
     def _on_message(self, hwnd, msg, wparam, lparam):
         try:
             if msg == WM_TRAY:
+                # version 4 里 lParam 就是通知码；老版本里是鼠标消息的低 16 位。
+                # 两种都取低 16 位，刚好都能对上。
                 event = (lparam & 0xFFFF) if lparam else 0
-                if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                if event in _OPEN_EVENTS:
                     if self.on_default:
                         self.on_default()
-                elif event == WM_RBUTTONUP:
+                elif event in _MENU_EVENTS:
                     self._popup_menu()
                 return 0
             if msg == WM_TIP:
