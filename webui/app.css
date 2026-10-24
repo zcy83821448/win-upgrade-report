@@ -1616,18 +1616,21 @@ input[type="number"]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0
 .mini-name:active{transform:scale(.97)}
 .report-row:active,.recent-row:active{transform-origin:left center}
 
-/* ---------- 2. 交错入场（只用于局部切换，页面切换不再逐项播） ---------- */
-@keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-@keyframes rowIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+/* ---------- 2. 交错入场（只用于局部切换，页面切换不再逐项播） ----------
+   ★ 这里故意只动 transform，不动 opacity：卡片的毛玻璃是 backdrop-filter，
+     只要祖先/自身在动画期间 opacity < 1，浏览器就会把这一段当成独立的
+     合成层，背景取不到 → 模糊会在动画期间消失、停下后才"跳"出来。 */
+@keyframes cardIn{from{transform:translateY(6px)}to{transform:none}}
+@keyframes rowIn{from{transform:translateY(5px)}to{transform:none}}
 @keyframes softIn{from{opacity:.4}to{opacity:1}}
 .anim-card{animation:cardIn 240ms var(--ease-out) backwards;animation-delay:var(--d,0ms)}
 .anim-row{animation:rowIn 200ms var(--ease-out) backwards;animation-delay:var(--d,0ms)}
 .anim-item{animation:rowIn 180ms var(--ease-out) backwards;animation-delay:var(--d,0ms)}
 .anim-soft{animation:softIn 160ms var(--ease-out) backwards;animation-delay:var(--d,0ms)}
 
-/* ---------- 3. 页面切换：只给容器一层很轻的入场 ---------- */
-@keyframes pageIn{from{opacity:0;transform:translate3d(0,8px,0)}to{opacity:1;transform:none}}
-.page.anim-page{animation:pageIn 180ms var(--ease-out) both}
+/* ---------- 3. 页面切换：从下往上的入场（同样只动 transform，保住模糊） ---------- */
+@keyframes pageIn{from{transform:translate3d(0,14px,0)}to{transform:none}}
+.page.anim-page{animation:pageIn 200ms var(--ease-out) both}
 
 /* ---------- 4. 数值 / 状态变化反馈 ----------
    文字变了就轻轻弹一下；状态点变了扩散一圈涟漪；关键数字放大回弹。 */
