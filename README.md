@@ -308,6 +308,16 @@ reports / logs / personalize`，不会把用户的 Key、历史报告和背景�
 - 顶栏是一整块玻璃，内容从它下面滚过去，卡片滑到标题栏底下会被再模糊一次；
 - 点「恢复默认外观」回到原来的浅色纸底界面，背景图会从程序目录删掉。
 
+换个壁纸之后大概是这个样子（卡片底色、按钮强调色、文字深浅都会跟着壁纸自动变）：
+
+| 概览 | 通知 |
+| --- | --- |
+| ![个性化后的概览](docs/screenshots/personalize-overview.png) | ![个性化后的通知页](docs/screenshots/personalize-notify.png) |
+
+| 个性化设置页（上传裁切 / 模糊 / 白纱 / 蒙层 / 取色） |
+| --- |
+| ![个性化设置页](docs/screenshots/personalize-personalize.png) |
+
 背景图保存在程序目录的 `personalize\` 下，属于用户数据：重新打包会保留，发布 zip 不含它。
 
 ## 文件说明
