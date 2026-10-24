@@ -232,14 +232,59 @@ def check(ignore=None, own_pid=None):
             "title": first["title"], "cls": first["cls"], "count": len(hits)}
 
 
-def current_foreground():
-    """前台窗口属于哪个程序（设置界面里做「一键把当前程序加进忽略名单」用）。"""
-    hwnd = _u32.GetForegroundWindow()
-    if not hwnd:
-        return ""
-    pid = wt.DWORD(0)
-    _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return _exe_of(pid.value)
+def list_windows(exclude_pid=None):
+    """列出当前桌面上的窗口（含最小化的），给「加进忽略名单」的选择框用。
+
+    忽略名单是按 exe 名匹配的，所以同一个程序的多个窗口只留一条，标题取
+    第一个有标题的窗口；count 记这个程序开了几个窗口。窗口标题是为了让人
+    一眼认出来是哪个程序。
+    """
+    found = {}
+    shell = _u32.GetShellWindow()
+    desktop = _u32.GetDesktopWindow()
+
+    def visit(hwnd, _):
+        try:
+            if not _u32.IsWindowVisible(hwnd):
+                return True
+            if hwnd in (shell, desktop):
+                return True
+            ex = _style(hwnd, GWL_EXSTYLE)
+            if ex & WS_EX_TOOLWINDOW:
+                return True                       # 工具窗口 → 系统组件
+            if _cloaked(hwnd):
+                return True                       # 系统说它其实看不见
+            title = _title_of(hwnd).strip()
+            if not title:
+                return True
+            pid = wt.DWORD(0)
+            _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return True
+            if exclude_pid and pid.value == int(exclude_pid):
+                return True                       # 自己（设置窗口）
+            exe = _exe_of(pid.value)
+            name = os.path.basename(exe or "")
+            if not name:
+                return True
+            key = name.lower()
+            if key in ALWAYS_IGNORE:
+                return True                       # 桌面/输入法/叠加层这类，加了也没用
+            item = found.get(key)
+            if item:
+                item["count"] += 1
+                return True
+            found[key] = {"name": name, "exe": exe, "title": title,
+                          "pid": pid.value, "count": 1}
+        except Exception:
+            pass
+        return True
+
+    try:
+        _u32.EnumWindows(_ENUMPROC(visit), 0)
+    except Exception:
+        pass
+    return sorted(found.values(), key=lambda w: (w["name"].lower(), w["title"]))
 
 
 if __name__ == "__main__":

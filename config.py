@@ -108,7 +108,7 @@ DEFAULTS = {
     "game_mode_enabled": True,        # 判定在玩全屏游戏/全屏应用时：不联网、不调 AI、不通知、不写盘
     "game_exit_hold_seconds": 60,     # 连续这么久都被判定「没在玩」才退出静默（防切进切出乱弹）
     "game_ignore": [],                # 额外的忽略名单（进程名），误判时加进来
-    # 设置界面里的「现在静默 2 小时」：存一个截止时间（ISO 字符串），
+    # 设置界面/托盘里的手动静默：存一个截止时间（ISO 字符串），
     # 哨兵读到它就会闭嘴到那个时间为止；空字符串表示不静默。
     "silent_until": "",
     # 托盘图标第一次挂上时，弹一次气泡告诉用户「我在后台跑」以及看不到图标怎么办。
@@ -130,6 +130,7 @@ DEFAULTS = {
     "merge_notifications": True,      # 一次发现多条线更新时合并成一条通知
     "detail": "标准",                  # 简短 / 标准 / 详细
     "include_official_text": False,   # 报告末尾附官方原文
+    "open_report_on_click": False,    # 点报告时直接用系统浏览器打开；关着就在界面里读
     "app_id": "WinUpdReport.App",
     "report_dir": REPORT_DIR,
     "max_context_chars": 16000,

@@ -38,7 +38,7 @@
     reportChannelFilter: '', reportSel: '', reportHtml: new Map(),
     selfcheck: null, liveLines: [], liveActive: false, liveRc: null,
     logText: '', logPath: '', logLoaded: false, logLoading: false, logAt: null,
-    readerFile: '', readerOpen: false, readerTitle: '', readerToken: 0,
+    readerFile: '', readerOpen: false, readerTitle: '', readerToken: 0, pickerOpen: false,
     foldAdvanced: false, startupTouchedAt: 0, pollTick: 0,
     maximized: false,
     chListHost: null, chDetailHost: null, checkHost: null,
@@ -510,7 +510,9 @@
       });
       btn.addEventListener('click', function () {
         if (btn.getAttribute('aria-pressed') === 'true') return;
-        $$(btn.parentElement.children).forEach(function (n) { n.setAttribute('aria-pressed', 'false'); });
+        Array.prototype.slice.call(btn.parentElement.children).forEach(function (n) {
+          n.setAttribute('aria-pressed', 'false');
+        });
         btn.setAttribute('aria-pressed', 'true');
         onChange(opt);
       });
@@ -1159,7 +1161,7 @@
       const reportCell = st.last_report
         ? el('button', {
           type: 'button', class: 'mini-btn', text: '打开',
-          onclick: function () { openReader(st.last_report); }
+          onclick: function () { openReportFile(st.last_report); }
         })
         : el('span', { class: 'ink-3', text: '—' });
       card.append(el('div', { class: 'mini-row' },
@@ -1185,7 +1187,7 @@
     reports.forEach(function (r) {
       card.append(el('button', {
         type: 'button', class: 'recent-row', title: r.file || '',
-        onclick: function () { openReader(r.file); }
+        onclick: function () { openReportFile(r.file); }
       },
         el('span', { class: 'recent-date', text: r.date ? mmdd(r.date) : mmdd(r.mtime) }),
         el('div', { class: 'recent-main' },
@@ -1472,7 +1474,7 @@
       reports.slice(0, 6).forEach(function (r) {
         list.append(el('button', {
           type: 'button', class: 'detail-report-row', title: r.summary || r.file || '',
-          onclick: function () { openReader(r.file); }
+          onclick: function () { openReportFile(r.file); }
         },
           el('span', { class: 'dr-date', text: r.date ? mmdd(r.date) : '' }),
           el('span', { class: 'dr-build', text: r.build || '' }),
@@ -1489,7 +1491,7 @@
       }, svgIcon('play'), '只检测这条线'),
       st.last_report ? el('button', {
         type: 'button', class: 'btn btn-secondary btn-sm', text: '打开最近报告',
-        onclick: function () { openReader(st.last_report); }
+        onclick: function () { openReportFile(st.last_report); }
       }) : null,
       el('button', {
         type: 'button', class: 'btn btn-ghost btn-sm', text: '打开报告文件夹',
@@ -1505,6 +1507,32 @@
   /* ============================================================
      通知
      ============================================================ */
+  /* 「暂时静默」：自己填时长（分钟/小时），不再写死 2 小时 */
+  function quietForControl() {
+    const qty = el('input', {
+      class: 'input', type: 'number', value: '2', min: '1', max: '168',
+      step: '1', 'aria-label': '静默多久', style: 'width:64px'
+    });
+    const unit = el('select', { class: 'input', 'aria-label': '静默时长的单位', style: 'width:80px' },
+      el('option', { value: '60', text: '小时' }),
+      el('option', { value: '1', text: '分钟' })
+    );
+    const btn = el('button', {
+      type: 'button', class: 'btn btn-secondary btn-sm', text: '静默',
+      onclick: function () {
+        const n = Math.round(Number(qty.value));
+        const mins = n * Number(unit.value);
+        if (!isFinite(n) || n < 1 || !isFinite(mins)) {
+          toast('error', '静默时长要填一个大于 0 的数字');
+          return;
+        }
+        if (mins > 7 * 24 * 60) { toast('error', '最多静默 7 天'); return; }
+        quietNow(mins);
+      }
+    });
+    return el('div', { style: 'display:flex;align-items:center;gap:8px' }, qty, unit, btn);
+  }
+
   function renderNotify(host) {
     const cfg = state.config || {};
 
@@ -1587,22 +1615,25 @@
         ),
         el('div', { class: 'row-ctl' },
           el('button', {
-            type: 'button', class: 'btn btn-secondary btn-sm', text: '加上当前程序',
-            onclick: function () { ignoreForeground(); }
+            type: 'button', class: 'btn btn-secondary btn-sm', text: '选择程序…',
+            onclick: function () { openIgnorePicker(); }
           })
         )
       ),
       el('div', { class: 'row' },
         el('div', { class: 'row-main' },
           el('div', { class: 'row-label', text: '暂时静默' }),
-          el('div', { class: 'row-help', text: quietActive ? '现在处于静默状态，' + hhmm(cfg.silent_until) + ' 之后恢复检查' : '临时不想被打扰时，可以静默两小时' })
+          el('div', { class: 'row-help', text: quietActive
+            ? '现在处于静默状态，' + hhmm(cfg.silent_until) + ' 之后恢复检查'
+            : '临时不想被打扰时，自己填一个时长；到点自动恢复检查' })
         ),
         el('div', { class: 'row-ctl' },
-          el('button', {
-            type: 'button', class: 'btn btn-secondary btn-sm',
-            text: quietActive ? '取消静默' : '静默 2 小时',
-            onclick: function () { quietNow(); }
-          })
+          quietActive
+            ? el('button', {
+              type: 'button', class: 'btn btn-secondary btn-sm', text: '取消静默',
+              onclick: function () { quietNow(); }
+            })
+            : quietForControl()
         )
       )
     )));
@@ -2016,6 +2047,7 @@
       host.append(el('button', {
         type: 'button', class: 'report-row' + (r.file === state.reportSel ? ' is-sel' : ''),
         title: r.file || '', onclick: function () {
+          if (state.config && state.config.open_report_on_click) { openExternal('browser', r.file); return; }
           state.reportSel = r.file;
           renderReportList();
           if (reportsNarrow()) { openReader(r.file); return; }
@@ -2311,8 +2343,9 @@
     await callApi('check_channel', [id], { busy: '正在检测这条线…', failText: '没能开始检测' });
   }
 
-  async function quietNow() {
-    const r = await callApi('quiet_now', [], { failText: '没能切换静默' });
+  async function quietNow(minutes) {
+    const args = (minutes === undefined || minutes === null) ? [] : [minutes];
+    const r = await callApi('quiet_now', args, { failText: '没能切换静默' });
     if (r && r.ok) {
       if (r.config) state.config = r.config;
       if (r.message) toast('ok', r.message);
@@ -2320,12 +2353,105 @@
     }
   }
 
-  async function ignoreForeground() {
-    const r = await callApi('ignore_foreground', [], { failText: '没能加进名单' });
-    if (r && r.ok) {
-      if (r.config) state.config = r.config;
-      if (r.message) toast('ok', r.message);
-      refreshPage();
+  /* ============================================================
+     忽略名单：从当前桌面的窗口里选（不再只看前台窗口——点按钮时
+     前台窗口就是设置窗口自己）
+     ============================================================ */
+  async function openIgnorePicker() {
+    const r = await callApi('list_windows', [], { failText: '取不到窗口列表' });
+    if (!r || !r.ok) return;
+    showWindowPicker((r.windows || []).filter(function (w) { return !w.ignored; }));
+  }
+
+  function addIgnore(name) {
+    name = String(name || '').trim();
+    if (!name) return false;
+    const cur = (state.config.game_ignore || []).slice();
+    if (cur.some(function (x) { return String(x).toLowerCase() === name.toLowerCase(); })) {
+      toast('info', name + ' 已经在忽略名单里了');
+      return false;
+    }
+    cur.push(name);
+    state.config.game_ignore = cur;
+    queueSave('game_ignore', cur);
+    toast('ok', '已把 ' + name + ' 加进忽略名单');
+    refreshPage();
+    return true;
+  }
+
+  function ensurePicker() {
+    let root = $('#windowPicker');
+    if (root) return root;
+    root = el('div', { class: 'picker', id: 'windowPicker', hidden: true });
+    const panel = el('div', {
+      class: 'picker-panel', role: 'dialog', 'aria-modal': 'true',
+      'aria-labelledby': 'pickerTitle', tabindex: '-1'
+    },
+      el('div', { class: 'picker-bar' },
+        el('div', { class: 'picker-title', id: 'pickerTitle', text: '选择要忽略的程序' }),
+        el('button', {
+          type: 'button', class: 'icon-btn', title: '关闭（Esc）', 'aria-label': '关闭',
+          onclick: function () { closePicker(); }
+        }, svgIcon('x'))
+      ),
+      el('div', { class: 'picker-help', text: '下面是当前桌面上打开的窗口（最小化的也算）。点一行，就把那个程序加进忽略名单：以后它全屏时不再触发静默。' }),
+      el('div', { class: 'picker-list', id: 'pickerList' }),
+      el('div', { class: 'picker-empty', id: 'pickerEmpty', hidden: true, text: '没有可添加的窗口。' })
+    );
+    root.append(panel);
+    root.addEventListener('click', function (e) { if (e.target === root) closePicker(); });
+    document.body.append(root);
+    return root;
+  }
+
+  function updatePickerEmpty(root) {
+    root = root || $('#windowPicker');
+    if (!root) return;
+    const list = root.querySelector('#pickerList');
+    const empty = root.querySelector('#pickerEmpty');
+    if (empty) empty.hidden = !!(list && list.children.length);
+  }
+
+  function showWindowPicker(windows) {
+    const root = ensurePicker();
+    const panel = root.querySelector('.picker-panel');
+    const list = root.querySelector('#pickerList');
+    list.textContent = '';
+    (windows || []).forEach(function (w) {
+      const row = el('button', {
+        type: 'button', class: 'picker-row', title: w.title || w.name || ''
+      },
+        el('div', { class: 'picker-row-main' },
+          el('div', { class: 'picker-row-title', text: w.title || '（没有标题）' }),
+          el('div', {
+            class: 'picker-row-sub',
+            text: (w.name || '') + (w.count > 1 ? ' · ' + w.count + ' 个窗口' : '')
+          })
+        ),
+        el('span', { class: 'picker-add', text: '加入忽略' })
+      );
+      row.addEventListener('click', function () {
+        if (addIgnore(w.name)) {
+          row.remove();
+          updatePickerEmpty(root);
+        }
+      });
+      list.append(row);
+    });
+    updatePickerEmpty(root);
+    root.hidden = false;
+    state.pickerOpen = true;
+    state.lastFocus = document.activeElement;
+    if (panel && panel.focus) panel.focus();
+  }
+
+  function closePicker() {
+    const root = $('#windowPicker');
+    if (!root || root.hidden) return;
+    root.hidden = true;
+    state.pickerOpen = false;
+    if (state.lastFocus && state.lastFocus.isConnected) {
+      try { state.lastFocus.focus(); } catch (e) { /* 焦点回不去就算了 */ }
     }
   }
 
@@ -2474,6 +2600,16 @@
     return head + src;
   }
 
+  /* 「点报告」：按设置决定在界面里读，还是直接交给系统浏览器打开 */
+  function openReportFile(file) {
+    if (!file) return;
+    if (state.config && state.config.open_report_on_click) {
+      openExternal('browser', file);
+      return;
+    }
+    openReader(file);
+  }
+
   async function openReader(file) {
     if (!file) return;
     state.readerFile = file;
@@ -2556,6 +2692,7 @@
      ============================================================ */
   function onKeydown(e) {
     if (e.key === 'Escape') {
+      if (state.pickerOpen) { e.preventDefault(); closePicker(); return; }
       if (state.readerOpen) { e.preventDefault(); closeReader(); return; }
       dismissLastToast();
     }

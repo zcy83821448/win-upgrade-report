@@ -131,8 +131,8 @@ AI 只在「确认出现新版本」之后被调用一次，而且同一个版�
 
 代价：扫一遍所有窗口约 **0.26 毫秒**，每 5 秒一次 = 单核的 **0.006%**。
 
-误判了怎么办：设置窗口「通知」页点「**把当前前台程序加进忽略名单**」，
-或者点「**现在静默 2 小时**」手动闭嘴。
+误判了怎么办：设置窗口「通知」页点「**选择程序…**」，在窗口列表里挑它
+（最小化的窗口也会列出来）；也可以在那一页自己填时长**手动静默**。
 注意：全屏看视频、全屏放幻灯片也会被当成「别打扰」——这是有意为之，跟静默时段一个意图。
 
 ## 托盘图标：一眼看到它在不在后台跑
@@ -354,13 +354,14 @@ python viewer.py index                       打开总览页（也可 folder / l
 | `game_ignore` | `[]` | 忽略名单（进程名），误判时加进来 |
 | `tray_style` | `std-std` | 托盘图标样式（`icons\styles.json` 里的 id，如 `thin-sm` / `bold-lg`）；设置界面下拉框直接改 |
 | `tray_hint_shown` | `false` | 托盘图标第一次挂上时弹一次气泡提示，只提示一次 |
-| `silent_until` | 空 | 手动静默的截止时间（设置界面按钮写它） |
+| `silent_until` | 空 | 手动静默的截止时间（设置界面/托盘按钮写它） |
 | `check_time` / `interval_days` / `check_at_logon` / `run_once_per_day` | 旧值 | **v2 遗留项，已不再使用**，只为了让老配置能正常读出来；`--check` 也不再受它们限制 |
 | `quiet_hours` | 空 | 静默时段，如 `23:00-07:00`；期间的通知攒到时段外补发 |
 | `api_key` | 空 | DeepSeek 的 Key，在设置窗口「设置」页填，存本机 `config.json` |
 | `model` / `disable_thinking` | `deepseek-flash` / `true` | 模型与思考模式开关 |
 | `detail` | `标准` | 报告详细程度：简短 / 标准 / 详细 |
 | `include_official_text` | `false` | 报告末尾附官方原文全文 |
+| `open_report_on_click` | `false` | 点报告时直接用系统浏览器打开；关着就在界面里读 |
 | `merge_notifications` | `true` | 一次多条线更新时合并成一条通知 |
 | `notify_on_error_after` | `3` | 连续失败几次后发一次错误通知，0 = 不发 |
 | `proxy` | 空 | 例如 `http://127.0.0.1:7897`，留空直连 |

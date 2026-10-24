@@ -947,7 +947,8 @@ class GuiApi:
         return ""
 
     @_guard
-    def quiet_now(self):
+    def quiet_now(self, minutes=None):
+        """手动静默：传分钟数就静默这么久；已经在静默中就取消。"""
         with self._lock:
             cfg = load_config()
         cur = (cfg.get("silent_until") or "").strip()
@@ -961,9 +962,22 @@ class GuiApi:
             cfg["silent_until"] = ""
             msg = "已取消手动静默，后台监控马上恢复检测。"
         else:
-            until = dt.datetime.now() + dt.timedelta(hours=2)
+            try:
+                mins = int(round(float(minutes))) if minutes is not None else 120
+            except Exception:
+                return {"ok": False, "error": "静默时长要填分钟数，例如 30"}
+            if mins < 1 or mins > 7 * 24 * 60:
+                return {"ok": False, "error": "静默时长要在 1 分钟到 7 天之间"}
+            until = dt.datetime.now() + dt.timedelta(minutes=mins)
             cfg["silent_until"] = until.isoformat(timespec="seconds")
-            msg = (f"已静默到 {until:%H:%M}（后台监控最多 5 秒后生效），"
+            h, m = divmod(mins, 60)
+            if h and m:
+                human = f"{h} 小时 {m} 分钟"
+            elif h:
+                human = f"{h} 小时"
+            else:
+                human = f"{m} 分钟"
+            msg = (f"已静默 {human}（到 {until:%H:%M}），后台监控最多 5 秒后生效，"
                    "到点自动恢复正常。")
         cfg["game_ignore"] = [str(x).strip() for x in (cfg.get("game_ignore") or [])
                               if str(x).strip()]
@@ -977,33 +991,30 @@ class GuiApi:
         return {"ok": True, "config": cfg, "message": msg}
 
     @_guard
-    def ignore_foreground(self):
+    def list_windows(self):
+        """当前桌面上能加进忽略名单的窗口（含最小化的）。
+
+        以前是取「前台窗口」，但用户点按钮的时候前台窗口就是设置界面自己，
+        永远只能把自己加进去；所以改成列出来让用户自己挑。
+        """
         try:
             import gamesense
-            exe = gamesense.current_foreground()
+            windows = gamesense.list_windows(exclude_pid=os.getpid())
         except Exception as e:
-            log_exception("读取当前前台程序")
-            return {"ok": False, "error": f"取不到当前前台程序：{e}"}
-        if not exe:
-            return {"ok": False, "error": "取不到当前前台程序（先点一下你想忽略的那个窗口再来）"}
-        name = os.path.basename(exe)
+            log_exception("枚举窗口")
+            return {"ok": False, "error": f"取不到窗口列表：{e}"}
+        # 自己的窗口（设置界面、报告查看器）不算，免得用户把本程序加进去
+        own_exes = {os.path.normcase(os.path.abspath(sys.executable))}
+        windows = [w for w in windows
+                   if os.path.normcase(os.path.abspath(w.get("exe") or ""))
+                   not in own_exes]
         with self._lock:
             cfg = load_config()
-        lst = list(cfg.get("game_ignore") or [])
-        if name.lower() in [str(x).lower() for x in lst]:
-            return {"ok": True, "config": cfg,
-                    "message": f"{name} 已经在忽略名单里了"}
-        lst.append(name)
-        cfg["game_ignore"] = lst
-        try:
-            save_config(cfg)
-        except Exception as e:
-            log_exception("保存忽略名单")
-            return {"ok": False, "error": f"保存失败：{e}"}
-        with self._lock:
-            self._cfg = cfg
-        return {"ok": True, "config": cfg,
-                "message": f"已把 {name} 加进忽略名单，以后不会因为它进静默模式。"}
+        ignored = {str(x).strip().lower() for x in (cfg.get("game_ignore") or [])
+                   if str(x).strip()}
+        for w in windows:
+            w["ignored"] = w["name"].lower() in ignored
+        return {"ok": True, "windows": windows}
 
     @_guard
     def set_tray_style(self, id=None):
