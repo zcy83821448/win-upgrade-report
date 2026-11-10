@@ -6,7 +6,7 @@
     python 打包.py --verify       打完顺便跑一次自检
 
 为什么是绿色文件夹版
-    程序要带 Python 运行时、pythonnet 和 WebView2 桥，单独一个 exe 每次
+    程序要带 Python 运行时，设置界面是独立的 WPF exe（系统自带 .NET Framework 4.8），单独一个 exe 每次
     启动都得先解压到 %TEMP%\\_MEIxxxx，慢，而且容易被临时文件清理工具、
     杀毒软件干扰。绿色文件夹版没有解包这一步：
       * 启动更快（冷启动约 1 秒，托盘再打开是毫秒级）
@@ -34,12 +34,15 @@ BUILD_DIR = os.path.join(BASE, "build")
 EXE_NAME = "win升级报告"
 GREEN_DIR = os.path.join(APP_DIR, EXE_NAME)                 # 绿色版整个文件夹
 ZIP_PATH = os.path.join(APP_DIR, f"{EXE_NAME}-绿色版.zip")   # 发布用的 zip
+UI_PROJ = os.path.join(BASE, "ui", "WinUpdReport.UI")
+UI_EXE_NAME = "WinUpdReport.UI.exe"
+UI_BUILD_EXE = os.path.join(UI_PROJ, "bin", "Release", "net48", UI_EXE_NAME)
 HIDDEN = ["gui", "checker", "viewer", "reporter", "source", "deepseek_api",
           "notify", "channels", "config", "mdlite", "app", "watch", "gamesense",
           "tray", "selfcheck", "hotwin",
           # 界面层：pywebview（WebView2 原生窗口）。平台模块是运行时动态导入的，
           # PyInstaller 静态分析看不到，必须显式写出来；clr 是 pythonnet 的入口。
-          "webview", "webview.platforms.winforms", "webview.platforms.win32",
+          "mdblocks", "webview", "webview.platforms.winforms", "webview.platforms.win32",
           "webview.http", "clr", "clr_loader"]
 # 用不到的模块一律别打进来。PyInstaller 会把 pywebview 里所有平台的
 # import 都分析一遍，环境里装了 PyQt5 就会把 47MB 的 Qt 拖进安装包；
@@ -70,9 +73,10 @@ README_TXT = """win升级报告
 「win升级报告.exe」就打开设置窗口。不需要安装，也不需要管理员权限。
 
 设置窗口是原生窗口：没有浏览器、没有地址栏，整个窗口（标题栏、最小化/最大化/关闭按钮）
-都是程序自己画的，拖动标题栏移动，四边四角可以缩放。界面用 WebView2 渲染，
-Win10/11 一般自带；老机器缺了会提示装一下 Edge WebView2 Runtime。
-后台哨兵不依赖它，只有设置窗口需要。
+都是程序自己画的，拖动标题栏移动，四边四角可以缩放。设置界面是 WPF 原生窗口，
+Win10 1903+ / Win11 自带 .NET Framework 4.8，不需要另外装运行时；
+极老系统会自动回退到旧版 HTML 界面（那条路才需要 WebView2）。
+后台哨兵不依赖界面，只有设置窗口需要。
 
 为什么是文件夹：程序要带 Python 运行时和 WebView2 的 .NET 桥，做成单个 exe
 的话每次启动都得先解压到临时目录，慢，而且容易被杀毒软件、清理工具干扰。
@@ -144,7 +148,7 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 图标样式可以换
 --------------
 托盘图标有 9 套样式（线条粗细：细/标准/粗  ×  箭头占位：小/标准/大）。
-在设置窗口「通知」页最下面的「任务栏图标」里挑，选完立刻生效，不用重启哨兵。
+在设置窗口「通知」页右侧的「托盘图标」里挑，选完立刻生效，不用重启哨兵。
 每款都带一张实际效果的预览图。
 
 为什么不是选「16px / 20px」：托盘槽位大小是系统定的（你这台是 16x16），
@@ -156,11 +160,11 @@ AI 只用来把抓到的官方说明总结成中文报告，而且：
 左侧栏「个性化」页可以上传自己的图片当窗口背景：
 
   * 上传后直接在窗口里拖动 / 四角缩放裁切，图片铺满整个窗口；
-  * 信息卡片是半透明毛玻璃，图片会透出来；「模糊强度 / 卡片白纱 / 图片蒙层」
-    三个滑杆可以调；
+  * 壁纸本体保持清晰，只有透过卡片 / 标题栏 / 侧栏看到的那块是模糊的（毛玻璃）；
+    「模糊强度 / 卡片白纱 / 图片蒙层」三个滑杆可以调，拖动时实时生效，切页也不会失效；
+  * 卡片玻璃会跟着卡片走：滚动 / 翻页时重画的是"哪块区域该模糊"，壁纸本身不变糊；
   * 卡片的底色和按钮强调色会从图片里自动取色（深图深色卡片、浅图浅色卡片），
-    文字颜色也会按图片明暗自动切换；
-  * 顶栏是一整块玻璃，内容从它下面滚过去，卡片滑到标题栏底下会被再模糊一次；
+    文字颜色也会按图片明暗自动切换；最上面还有一层很淡的保底蒙层，亮色壁纸上也看得清；
   * 不想用了点「恢复默认外观」，就回到原来的浅色界面。
 
 背景图存在程序目录的 personalize\ 里，重新打包会保留；发布 zip 不含你的图片。
@@ -198,9 +202,9 @@ win升级报告.exe --selftest          自检，结果写在 ..\\logs\\自检�
 
 需要管理员权限的操作
 --------------------
-「安装 / 更新计划任务」会弹一次 UAC（Windows 计划任务必须提权才能注册）。
+「安装后台任务」会弹一次 UAC（Windows 计划任务必须提权才能注册）。
 安装时会顺手把旧版的每日任务（WinUpdReport_Daily）卸掉，它已经不需要了。
-不想给权限就用「自启与后台」页的「一键设置开机自启」，效果一样
+不想给权限就用「自启与后台」页的「登录后自动启动」开关，效果一样
 （往「启动」文件夹放个快捷方式，登录时启动哨兵）。
 
 排查「怎么没动静了」
@@ -286,8 +290,26 @@ def _restore_user_data(bak, kept):
     shutil.rmtree(bak, ignore_errors=True)
 
 
+def _build_ui():
+    """先编 WPF 设置界面（net48，只产出几百 KB 的 exe）。"""
+    if not os.path.isdir(UI_PROJ):
+        print("没有找到 WPF 界面工程，跳过：", UI_PROJ)
+        return ""
+    try:
+        rc = run(["dotnet", "build", "-c", "Release", "-v", "quiet"], cwd=UI_PROJ)
+    except Exception as e:
+        print("调用 dotnet 失败（界面会回退旧版）：", e)
+        return ""
+    if rc != 0 or not os.path.exists(UI_BUILD_EXE):
+        print("WPF 界面编译失败（界面会回退旧版），返回码", rc)
+        return ""
+    print("WPF 设置界面编译完成：", UI_BUILD_EXE)
+    return UI_BUILD_EXE
+
+
 def main():
     os.makedirs(APP_DIR, exist_ok=True)
+    ui_exe = _build_ui()
     for name in DATA:
         p = os.path.join(BASE, name)
         if not os.path.exists(p):
@@ -330,6 +352,13 @@ def main():
         print("PyInstaller 失败，退出码", rc)
         return rc
 
+    # 把 WPF 设置界面 exe 放进绿色文件夹根目录（和 win升级报告.exe 并排）
+    if ui_exe:
+        import shutil
+        dst = os.path.join(GREEN_DIR, UI_EXE_NAME)
+        shutil.copy2(ui_exe, dst)
+        print("已放入 WPF 设置界面:", dst)
+
     # ---------------- 绿色文件夹版 ----------------
     exe = os.path.join(GREEN_DIR, EXE_NAME + ".exe")
     if not os.path.exists(exe):
@@ -354,7 +383,7 @@ def main():
               f"  ({os.path.getsize(zp) / 1024 / 1024:.1f} MB)")
 
     print("\n【这台机器怎么用】装完直接双击 exe 就打开设置窗口；")
-    print("想让它在后台一直盯着，进「自启与后台」页点「一键设置开机自启」。")
+    print("想让它在后台一直盯着，进「自启与后台」页打开「登录后自动启动」开关。")
 
     if "--verify" in sys.argv:
         print("\n跑一次自检（窗口程序没有控制台，结果看日志文件）…")
@@ -380,3 +409,6 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+

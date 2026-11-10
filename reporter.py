@@ -7,9 +7,36 @@ import html
 import datetime as dt
 
 from mdlite import render_page, render_raw
-from config import REPORT_DIR
+from config import REPORT_DIR, atomic_write_text, resource_path
 
 INDEX_NAME = "总览.html"
+
+_READER_CSS_CACHE = None
+
+
+def reader_css():
+    """报告排版 CSS 的唯一来源：webui/reader.css。
+
+    设置窗口内嵌预览、独立报告窗口、浏览器直接打开的报告页都读这一份，
+    保证四个地方看起来一模一样（以前被复制成三份，已经出现字号漂移）。
+    """
+    global _READER_CSS_CACHE
+    if _READER_CSS_CACHE is None:
+        try:
+            p = resource_path(os.path.join("webui", "reader.css"))
+            with open(p, "r", encoding="utf-8") as f:
+                _READER_CSS_CACHE = f.read()
+        except Exception:
+            _READER_CSS_CACHE = ""
+    return _READER_CSS_CACHE
+
+
+def reader_style_tag():
+    css = reader_css()
+    if not css:
+        return ""
+    return '<style id="winupd-reader">\n' + css + '\n</style>'
+
 
 
 def chan_slug(cid):
@@ -32,13 +59,14 @@ def report_paths(cfg, cid, build, date_str):
 
 
 def write(cfg, cid, build, markdown, title=None):
+    """写报告：md 和 html 都原子落盘，浏览器不会读到写了一半的半页。"""
     date_str = dt.date.today().isoformat()
     md_path, html_path = report_paths(cfg, cid, build, date_str)
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(markdown.rstrip() + "\n")
+    atomic_write_text(md_path, markdown.rstrip() + "\n")
     try:
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(render_page(markdown, title or os.path.basename(md_path)[:-3]))
+        page = render_page(markdown, title or os.path.basename(md_path)[:-3],
+                           extra_css=reader_style_tag())
+        atomic_write_text(html_path, page)
     except Exception:
         html_path = ""
     return md_path, html_path
@@ -130,6 +158,5 @@ def write_index(cfg, state, chan_names):
 <ul class="tl">{''.join(items) or '<li>还没有报告</li>'}</ul>
 """
     path = os.path.join(base, INDEX_NAME)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(render_raw(body, "Windows 更新报告总览"))
+    atomic_write_text(path, render_raw(body, "Windows 更新报告总览"))
     return path

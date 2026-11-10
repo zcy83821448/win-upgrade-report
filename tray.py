@@ -234,7 +234,6 @@ class Tray:
         self._error = ""
         self._alive = False
         self._balloon_req = None
-        self._balloon_shown = False
         self._icon_from_file = False
         self._lock = threading.Lock()
         self._wndproc = _WNDPROC(self._on_message)   # 必须留住引用，否则被回收
@@ -359,6 +358,12 @@ class Tray:
             self._alive = True
             self._ready.set()
 
+            # 图标还没挂上时请求过的气泡，在这里补弹一次
+            with self._lock:
+                pending_balloon = self._balloon_req is not None
+            if pending_balloon:
+                _u32.PostMessageW(self._hwnd, WM_TIP, 0, 0)
+
             # 自己的消息循环
             msg = wt.MSG()
             while _u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -404,14 +409,18 @@ class Tray:
         return _u32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _apply_tip(self):
-        """把提示文字 / 气泡刷新到图标上。"""
+        """把提示文字 / 气泡刷新到图标上。
+
+        注意：以前这里用 `_balloon_shown` 只允许弹第一条气泡，结果首次「图标在这里」
+        提示之后，「体检完成」「设置界面没能打开」这些气泡全部静默丢失。
+        调用方本来就只在需要时调用一次 balloon()，这里不再做一次性限制。
+        """
         with self._lock:
             balloon = self._balloon_req
             self._balloon_req = None
         nid = self._nid(NIF_TIP | NIF_SHOWTIP)
         _shell.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
-        if balloon and not self._balloon_shown:
-            self._balloon_shown = True
+        if balloon:
             nid2 = self._nid(NIF_INFO)
             nid2.szInfoTitle = balloon[0]
             nid2.szInfo = balloon[1]

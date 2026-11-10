@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
-"""DeepSeek 调用（关闭思考模式）与报告模板。"""
+"""DeepSeek 调用（关闭思考模式）与报告模板。
+
+这里和 source.py 用同一套网络约定：遵守 `proxy` / `retries` / `request_timeout`，
+可重试的错误自动重试。以前这里直接 urlopen，代理用户抓取能过、AI 永远失败，
+只能拿到兜底报告——那等于报告功能对代理用户不可用。
+"""
 import json
+import re
+import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -20,6 +28,38 @@ DETAIL_SPEC = {
     "详细": "篇幅可以长一些：更新概述 4-6 句，主要变更尽量覆盖原文每个改动点（可到 12 条），"
             "已知问题逐条列出，并给出对普通用户/内测用户的升级建议。",
 }
+
+_RETRY_STATUS = (408, 409, 425, 429, 500, 502, 503, 504)
+_OPENERS = {}
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _opener(proxy=""):
+    key = (proxy or "").strip()
+    op = _OPENERS.get(key)
+    if op is None:
+        handlers = []
+        if key:
+            handlers.append(urllib.request.ProxyHandler({"http": key, "https": key}))
+        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        op = urllib.request.build_opener(*handlers)
+        _OPENERS[key] = op
+    return op
+
+
+def strip_code_fence(text):
+    """模型偶尔会把整份报告包在 ```markdown ... ``` 里；去掉围栏再存盘。"""
+    s = (text or "").strip()
+    m = re.match(r"^```(?:markdown|md|Markdown)?\s*\r?\n(.*?)\r?\n```\s*$", s, re.S)
+    if m:
+        return m.group(1).strip()
+    # 有的模型只包了开头/结尾其中一边，尽量收拾干净
+    if s.startswith("```") and s.endswith("```") and len(s) > 8:
+        inner = s[3:-3].strip()
+        if inner:
+            return inner
+    return s
 
 
 def build_prompt(channel_name, build, prev_build, notes_url, notes_kind, notes_text,
@@ -70,6 +110,41 @@ def build_prompt(channel_name, build, prev_build, notes_url, notes_kind, notes_t
     return "\n".join(lines)
 
 
+def _post_json(url, body, api_key, timeout, proxy="", retries=0):
+    """POST 一个 JSON，返回解析后的 dict；遵守代理与重试。"""
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    opener = _opener(proxy)
+    last = None
+    for attempt in range(max(0, retries) + 1):
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + api_key,
+                     "User-Agent": _UA,
+                     "Accept": "application/json"})
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            last = e
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            if e.code in _RETRY_STATUS and attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"DeepSeek HTTP {e.code}: {detail or e.reason}") from e
+        except Exception as e:                    # 网络错误 / 超时
+            last = e
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"DeepSeek 请求失败: {type(e).__name__}: {e}") from e
+    raise RuntimeError(f"DeepSeek 请求失败: {last}")
+
+
 def summarize(cfg, api_key, prompt, timeout=None):
     url = (cfg.get("api_base") or "https://api.deepseek.com").rstrip("/") + "/chat/completions"
     body = {
@@ -78,31 +153,25 @@ def summarize(cfg, api_key, prompt, timeout=None):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": int(cfg.get("max_tokens") or 1600),
+        "max_tokens": max(16, int(cfg.get("max_tokens") or 1600)),
         "temperature": float(cfg.get("temperature") or 0.3),
         "stream": False,
     }
     if cfg.get("disable_thinking", True):
         body["thinking"] = {"type": "disabled"}
 
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + api_key})
+    timeout = max(15, min(int(timeout or 180), 600))
+    retries = max(0, min(int(cfg.get("retries") if cfg.get("retries") is not None else 2), 5))
+    data = _post_json(url, body, api_key, timeout,
+                      proxy=(cfg.get("proxy") or "").strip(), retries=retries)
     try:
-        with urllib.request.urlopen(req, timeout=timeout or 180) as r:
-            data = json.load(r)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:500]
-        raise RuntimeError(f"DeepSeek HTTP {e.code}: {detail}") from e
-    except Exception as e:
-        raise RuntimeError(f"DeepSeek 请求失败: {type(e).__name__}: {e}") from e
-
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
         raise RuntimeError("DeepSeek 返回格式异常: " +
                            json.dumps(data, ensure_ascii=False)[:400])
+    if not isinstance(content, str):
+        raise RuntimeError("DeepSeek 返回内容为空或格式异常")
+    return strip_code_fence(content).strip()
 
 
 FALLBACK = """# {channel} 更新报告：{build}

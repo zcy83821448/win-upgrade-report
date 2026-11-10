@@ -329,7 +329,11 @@
   }
 
   function titlebarState(info) {
-    if (info.tone === 'ok') return info.text + ' · 每 ' + intervalMinutes() + ' 分钟';
+    if (info.tone === 'ok') {
+      const act = state.watch && state.watch.activity;
+      if (act) return String(act);
+      return info.text + ' · 每 ' + intervalMinutes() + ' 分钟';
+    }
     if (info.tone === 'off') return '监控已停止';
     return info.text;
   }
@@ -338,6 +342,9 @@
     const w = state.watch || {};
     const enabled = enabledChannels();
     const parts = [];
+    if (w.online && w.activity) {
+      parts.push({ text: '正在：' + w.activity, strong: true });
+    }
     if (w.online) {
       if (enabled.length) {
         const names = enabled.slice(0, 2).map(function (c) { return compactName(c.name); }).join('、');
@@ -360,7 +367,9 @@
   function startupMetaParts() {
     const w = state.watch || {};
     const modeText = { normal: '普通模式', game: '全屏中', paused: '已暂停', stopped: '已停止' }[w.mode] || '普通模式';
-    const parts = [{ text: modeText }];
+    const parts = [];
+    if (w.online && w.activity) parts.push({ text: '正在：' + w.activity, strong: true });
+    parts.push({ text: modeText });
     parts.push({ text: '每 ' + intervalMinutes() + ' 分钟检查一次' });
     if (w.last_check) parts.push({ text: '上次检查 ' + timeLabel(w.last_check) });
     if (typeof w.checks === 'number' && w.checks > 0) {
@@ -662,11 +671,17 @@
 
   /* ============================================================
      自动保存
+     目标：改了就一定存上。关窗/退出前会强制 flush；临时 IO 失败会保留
+     待保存内容并退避重试，而不是清空后只弹一个 toast。
      ============================================================ */
+  let saveRetryTimer = null;
+  let saveRetryDelay = 400;
+  let pollFails = 0;
+
   function queueSave(key, value) {
     pendingPatch[key] = value;
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(flushSave, 400);
+    saveTimer = setTimeout(function () { flushSave(); }, 400);
   }
 
   function markFieldError(key, msg) {
@@ -678,31 +693,72 @@
     }
   }
 
+  function scheduleSaveRetry() {
+    clearTimeout(saveRetryTimer);
+    saveRetryTimer = setTimeout(function () { flushSave(); }, saveRetryDelay);
+    saveRetryDelay = Math.min(Math.round(saveRetryDelay * 1.8), 8000);
+  }
+
+  function savedHintUnsaved(msg) {
+    const n = $('#savedHint');
+    if (!n) return;
+    n.classList.remove('is-bad', 'is-on', 'is-pop');
+    n.textContent = '未保存' + (msg ? '：' + (msg.length > 12 ? msg.slice(0, 12) + '…' : msg) : '');
+    n.classList.add('is-on', 'is-bad');
+    clearTimeout(savedTimer);
+  }
+
   async function flushSave() {
     const patch = pendingPatch;
     pendingPatch = {};
     const keys = Object.keys(patch);
-    if (!keys.length) return;
+    if (!keys.length) return true;
     const a = bridge();
-    if (!a) return;
+    if (!a) {
+      pendingPatch = Object.assign(patch, pendingPatch);
+      savedHintUnsaved('后台未连接');
+      scheduleSaveRetry();
+      return false;
+    }
     try {
       const r = await a.save_config(patch);
       if (r && r.ok) {
         state.config = r.config || Object.assign({}, state.config, patch);
         keys.forEach(function (k) { markFieldError(k, ''); });
         savedHintOk();
+        saveRetryDelay = 400;
+        clearTimeout(saveRetryTimer);
         if (r.message) toast('ok', r.message);
         updateStatusWidgets();
+        return true;
+      }
+      const msg = (r && r.error) || '保存失败，检查一下再试';
+      if (r && r.retry) {
+        /* 临时 IO 故障：保留待保存内容，自动重试，顶栏显示"未保存" */
+        pendingPatch = Object.assign(patch, pendingPatch);
+        savedHintUnsaved(msg);
+        scheduleSaveRetry();
       } else {
-        const msg = (r && r.error) || '保存失败，检查一下再试';
+        /* 校验类错误：提示用户，等待下一轮修改再提交 */
         savedHintFail(msg);
         toast('error', msg);
         keys.forEach(function (k) { if (k === 'quiet_hours') markFieldError(k, msg); });
       }
+      return false;
     } catch (e) {
       noteErr(e);
-      savedHintFail('保存失败');
+      pendingPatch = Object.assign(patch, pendingPatch);
+      savedHintUnsaved('保存失败');
+      scheduleSaveRetry();
+      return false;
     }
+  }
+
+  /** 关窗 / 完全退出 / 页面隐藏前，把还没发出去的保存都发完。 */
+  async function flushAll() {
+    clearTimeout(saveTimer);
+    clearTimeout(saveRetryTimer);
+    return await flushSave();
   }
 
   /* ============================================================
@@ -832,6 +888,9 @@
     applyPersonalize();
     refreshPersonalMood();
     go('overview', true);
+    /* 支持 index.html#reports 这种深链（截图/排查时直接打开某一页；正常打开不受影响） */
+    const bootPage = (location.hash || '').replace(/^#/, '');
+    if (bootPage && PAGE_TITLES[bootPage]) go(bootPage, true);
     pollOnce();
   }
 
@@ -854,17 +913,56 @@
     ));
   }
 
+  function setConn(ok, text) {
+    const n = $('#connHint');
+    if (!n) return;
+    if (ok) {
+      n.hidden = true;
+      n.textContent = '';
+      n.classList.remove('is-bad');
+      return;
+    }
+    n.hidden = false;
+    n.textContent = text || '正在连接后台…';
+    n.classList.toggle('is-bad', pollFails > 2);
+  }
+
+  function withTimeout(promise, ms) {
+    return Promise.race([
+      Promise.resolve(promise),
+      new Promise(function (_resolve, reject) {
+        setTimeout(function () { reject(new Error('timeout')); }, ms);
+      })
+    ]);
+  }
+
   async function pollOnce() {
     clearTimeout(pollTimer);
     const a = bridge();
-    if (!a) return;
+    if (!a) {
+      setConn(false, '正在连接后台…');
+      pollTimer = setTimeout(pollOnce, 2000);
+      return;
+    }
     try {
-      const r = await a.poll();
-      if (r && r.ok) applyPoll(r);
+      /* 后台卡住时不要无限等待：单次 poll 超过 5 秒就当失败，
+         界面显示「连接中断，正在自动重试」，恢复后自动复位。 */
+      const r = await withTimeout(a.poll(), 5000);
+      if (r && r.ok) {
+        pollFails = 0;
+        setConn(true);
+        applyPoll(r);
+      } else {
+        throw new Error('bad poll result');
+      }
     } catch (e) {
       noteErr(e);
+      pollFails++;
+      setConn(false, pollFails > 2
+        ? '后台连接中断，正在自动重试…'
+        : '正在连接后台…');
     }
-    pollTimer = setTimeout(pollOnce, 1000);
+    pollTimer = setTimeout(pollOnce, pollFails ? 2000 : 1000);
   }
 
   function applyPoll(r) {
@@ -1546,8 +1644,8 @@
     host.append(sectionEl('检查节奏', null, cardEl(
       rowControl('多久检查一次', '后台监控开着的时候，按这个间隔自动查一遍',
         numInput({ key: 'watch_interval_minutes', value: cfg.watch_interval_minutes, min: 1, max: 1440, unit: '分钟', width: 96, label: '检查间隔' })),
-      rowControl('连续出错几次才提醒', '网络偶尔抽风不算；连续出错到这个次数才发通知',
-        numInput({ key: 'notify_on_error_after', value: cfg.notify_on_error_after, min: 1, max: 99, unit: '次', width: 80, label: '连续出错次数' }))
+      rowControl('连续出错几次才提醒', '连续出错到这个次数才发一次通知；填 0 表示不提醒',
+        numInput({ key: 'notify_on_error_after', value: cfg.notify_on_error_after, min: 0, max: 99, unit: '次', width: 80, label: '连续出错次数' }))
     )));
 
     const notifyOn = cfg.notify !== false;
@@ -2140,10 +2238,11 @@
     const wrap = el('div', { class: 'report-frame-wrap' });
     const frame = el('iframe', {
       class: 'report-frame', title: '报告内容',
-      sandbox: 'allow-same-origin allow-popups'
+      sandbox: 'allow-same-origin'
     });
     const loading = el('div', { class: 'frame-loading' }, el('span', { class: 'spinner' }), el('span', { text: '正在打开报告…' }));
     frame.addEventListener('load', function () { loading.hidden = true; });
+    if (window.WinUpdChrome) window.WinUpdChrome.wireFrame(frame);
     frame.srcdoc = reportDoc(html);
     wrap.append(frame, loading);
     return wrap;
@@ -2468,6 +2567,8 @@
 
   async function testApi() {
     setRefText('apiTest', '正在测试…');
+    /* 先把刚输入的 Key/地址存下去，否则后端可能拿到的是旧配置 */
+    await flushAll();
     await callApi('test_api', [], { busy: '正在测试 AI 的 Key…' });
   }
 
@@ -2587,20 +2688,11 @@
   /* ============================================================
      报告阅读器
      ============================================================ */
-  const EMBED_CSS = '<style id="dsh-embed">' +
-    'html,body{background:#fff!important;margin:0!important;padding:0!important;color:#1C1B19}' +
-    /* 字号与后端的应用内嵌字号保持一致（13.5px 正文 / 21px h1），这里只做兜底、不加 !important，
-       后端注入的 !important 规则始终优先，避免两套字号打架 */
-    'body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;font-size:13.5px;line-height:1.7}' +
-    'h1{font-size:21px;line-height:1.4;font-weight:600}' +
-    'img{max-width:100%;height:auto}a{color:#1F5AE0}' +
-    'main{box-shadow:none!important;border-radius:0!important;background:#fff!important;max-width:560px;margin:0 auto;padding:24px 28px}' +
-    '::-webkit-scrollbar{width:10px}::-webkit-scrollbar-track{background:transparent}' +
-    '::-webkit-scrollbar-thumb{background:#D8D3CA;border:3px solid #fff;background-clip:padding-box;border-radius:8px}' +
-    '</style>';
-
+  /* 报告排版 CSS 的唯一来源在 webui/reader.css，由后端注入到 HTML 里
+     （设置窗口内嵌、阅读器、独立报告窗口、浏览器打开共用同一份）。
+     这里只补一个 target=_blank，避免点击外链把内嵌阅读器导航走。 */
   function reportDoc(html) {
-    const head = '<base target="_blank">' + EMBED_CSS;
+    const head = '<base target="_blank">';
     const src = String(html || '');
     if (/<head[^>]*>/i.test(src)) return src.replace(/<head[^>]*>/i, function (m) { return m + head; });
     if (/<html[^>]*>/i.test(src)) return src.replace(/<html[^>]*>/i, function (m) { return m + '<head>' + head + '</head>'; });
@@ -3348,6 +3440,10 @@
   function setMaximizedUI(max) {
     const on = !!max;
     state.maximized = on;
+    if (window.WinUpdChrome) {
+      window.WinUpdChrome.setMaximized(on);
+      return;
+    }
     document.body.classList.toggle('is-maximized', on);
     const btn = $('#winMax');
     const use = btn ? btn.querySelector('use') : null;
@@ -3368,51 +3464,21 @@
   }
 
   async function windowClose() {
+    /* 先把还没保存的改动存掉再关：以前关窗会丢掉最后 1 秒内改的东西。 */
+    await flushAll();
     const r = await winCall('window_close');
     if (!r) await closeWindow();
   }
 
   function wireTitlebar() {
-    const drag = $('#titlebarDrag');
-    if (drag) {
-      drag.addEventListener('dblclick', function (e) {
-        e.preventDefault();
-        windowToggleMax();
-      });
+    /* 标题栏/窗口按钮/缩放/拖动双击全部由共享的 chrome.js 处理，
+       和独立报告窗口用同一套逻辑与样式；这里只提供"关窗前先保存"的回调。 */
+    if (window.WinUpdChrome) {
+      window.WinUpdChrome.init({ onClose: function () { windowClose(); } });
+    } else {
+      const close = $('#winClose');
+      if (close) close.addEventListener('click', windowClose);
     }
-    const min = $('#winMin');
-    const max = $('#winMax');
-    const close = $('#winClose');
-    if (min) min.addEventListener('click', windowMinimize);
-    if (max) max.addEventListener('click', windowToggleMax);
-    if (close) close.addEventListener('click', windowClose);
-
-    $$('.wbtn').forEach(function (btn) {
-      btn.addEventListener('mousedown', function (e) { e.stopPropagation(); });
-    });
-
-    $$('.rz').forEach(function (rz) {
-      rz.addEventListener('mousedown', function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (state.maximized) return;
-        const a = bridge();
-        if (a && typeof a.begin_resize === 'function') {
-          try { a.begin_resize(rz.dataset.edge); } catch (err) { /* 预览里没有后端，静默 */ }
-        }
-      });
-    });
-
-    const bar = $('#titlebar');
-    const syncFocus = function () {
-      if (!bar) return;
-      bar.classList.toggle('is-blurred', !document.hasFocus());
-    };
-    window.addEventListener('focus', syncFocus);
-    window.addEventListener('blur', function () {
-      if (bar) bar.classList.add('is-blurred');
-    });
-    syncFocus();
   }
 
   function wireChrome() {
@@ -3421,7 +3487,7 @@
       btn.addEventListener('click', function () { go(btn.dataset.page); });
     });
     const closeBtn = $('#btnCloseWindow');
-    if (closeBtn) closeBtn.addEventListener('click', function () { closeWindow(); });
+    if (closeBtn) closeBtn.addEventListener('click', function () { windowClose(); });
     const quitBtn = $('#btnQuitAll');
     if (quitBtn) {
       quitBtn.addEventListener('click', function () {
@@ -3442,13 +3508,22 @@
     const folderBtn = $('#readerFolder');
     if (folderBtn) folderBtn.addEventListener('click', function () { openExternal('report_folder'); });
     const frame = $('#readerFrame');
-    if (frame) frame.addEventListener('load', function () {
-      const loading = $('#readerLoading');
-      if (loading) loading.hidden = true;
-      frame.style.visibility = 'visible';
-    });
+    if (frame) {
+      if (window.WinUpdChrome) window.WinUpdChrome.wireFrame(frame);
+      frame.addEventListener('load', function () {
+        const loading = $('#readerLoading');
+        if (loading) loading.hidden = true;
+        frame.style.visibility = 'visible';
+      });
+    }
 
     document.addEventListener('keydown', onKeydown);
+
+    /* 关窗、切走、休眠前都把待保存内容提交掉 */
+    window.addEventListener('pagehide', function () { flushAll(); });
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') flushAll();
+    });
 
     /* 窗口宽度跨过断点时，报告页在「双栏预览 / 单栏点开阅读」之间切换 */
     let reportsWide = !reportsNarrow();
@@ -3470,6 +3545,7 @@
   }
 
   async function quitAll() {
+    await flushAll();
     const a = bridge();
     if (!a) return;
     try { await a.quit_all(); } catch (e) { noteErr(e); }
@@ -3487,6 +3563,16 @@
     setTimeout(function () {
       if (!state.booted && !state.booting && bridge()) start();
     }, 6000);
+    /* 最后兜底：10 秒还没起来就不要一直转圈，给一个人话错误页 + 重载按钮。 */
+    setTimeout(function () {
+      if (state.booted) return;
+      state.booting = false;
+      clearTimeout(bootTimer);
+      fatal('后台没有响应',
+        '设置窗口的界面已经加载，但后台接口一直没有回应。\n' +
+        '可以点下面的「重新加载」再试一次；如果反复这样，关掉窗口重新打开一次程序。');
+      setConn(false, '后台没有响应');
+    }, 16000);
   }
 
   if (document.readyState === 'loading') {

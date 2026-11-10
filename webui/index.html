@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
 <title>win升级报告</title>
+<link rel="stylesheet" href="chrome.css">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -75,6 +76,7 @@
   <header class="topbar">
     <h1 class="page-title" id="pageTitle">概览</h1>
     <div class="topbar-meta">
+      <span class="conn-hint" id="connHint" role="status" aria-live="polite" hidden></span>
       <span class="saved" id="savedHint" role="status" aria-live="polite"></span>
     </div>
   </header>
@@ -185,11 +187,12 @@
     </div>
     <div class="reader-body" id="readerBody">
       <div class="reader-loading" id="readerLoading"><span class="spinner"></span><span>正在打开报告…</span></div>
-      <iframe id="readerFrame" title="报告内容" sandbox="allow-same-origin allow-popups"></iframe>
+      <iframe id="readerFrame" title="报告内容" sandbox="allow-same-origin"></iframe>
     </div>
   </div>
 </div>
 
+<script src="chrome.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

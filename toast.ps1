@@ -1,4 +1,4 @@
-# 弹出一条 Windows 通知，点击正文 / 按钮都走自定义协议，交给 viewer.py 处理
+﻿# 弹出一条 Windows 通知，点击正文 / 按钮都走自定义协议，交给 viewer.py 处理
 param(
     [Parameter(Mandatory=$true)][string]$AppId,
     [Parameter(Mandatory=$true)][string]$Title,
@@ -13,6 +13,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $Tag) { $Tag = "winupd" }
 [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
 [void][Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime]
 [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]

@@ -8,7 +8,9 @@
   r/<频道目录>/<构建号>    某一份具体报告
 """
 import os
+import re
 import sys
+import time
 import subprocess
 import winreg
 
@@ -21,6 +23,23 @@ PS = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                   r"System32\WindowsPowerShell\v1.0\powershell.exe")
 PROTOCOL = "winupdrept"
 NO_WINDOW = 0x08000000
+
+
+_TAG_SEQ = 0
+
+
+def _default_tag(arg1="", arg2=""):
+    """每条通知一个独立 Tag。
+
+    Windows 里「同一个 Group + Tag」的新通知会**替换**旧通知。以前所有通知共用
+    tag=winupd，于是：合并通知关掉时多条线更新只剩最后一条；测试通知/错误通知
+    会把刚弹出来的「有新版本」顶掉。Tag 唯一后，通知中心能把历史都留下。
+    """
+    global _TAG_SEQ
+    _TAG_SEQ = (_TAG_SEQ + 1) % 1000
+    base = re.sub(r"[^0-9A-Za-z_.-]+", "-", f"{arg1 or ''}-{arg2 or ''}").strip("-")
+    base = base[:38].strip("-") or "toast"
+    return f"winupd-{base}-{time.time_ns() % 10 ** 12:012d}{_TAG_SEQ:03d}"
 
 
 def _pythonw():
@@ -76,15 +95,17 @@ def register_app(app_id):
 
 
 def show(title, body, app_id="WinUpdReport.App", arg1="index", arg2="folder",
-         button1="查看报告", button2="打开总览", silent=False):
+         button1="查看报告", button2="打开总览", silent=False, tag=None):
     if not os.path.exists(TOAST_PS1):
         return False, "toast.ps1 不存在"
     ensure_bom(TOAST_PS1)
+    tag = (tag or _default_tag(arg1, arg2))[:60]
     cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
            "-WindowStyle", "Hidden", "-File", TOAST_PS1,
            "-AppId", app_id, "-Title", title, "-Body", body, "-Protocol", PROTOCOL,
            "-Arg1", arg1 or "", "-Arg2", arg2 or "",
-           "-Button1", button1 or "", "-Button2", button2 or ""]
+           "-Button1", button1 or "", "-Button2", button2 or "",
+           "-Tag", tag]
     if silent:
         cmd.append("-Silent")
     try:

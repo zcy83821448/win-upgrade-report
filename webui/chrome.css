@@ -1,0 +1,82 @@
+/* ============================================================
+   窗口外壳（唯一来源）：自绘标题栏 / 窗口按钮 / 八向缩放抓手 / 焦点样式
+   设置窗口（index.html）和独立报告窗口（viewer.py）共用这一份，
+   避免以前各复制一套、改一处另一处漂移的问题。
+   依赖的 CSS 变量（两边的 :root 都提供）：
+     --bg --paper-line --paper-line-strong --ink --ink-2 --ink-3 --accent
+   ============================================================ */
+
+:focus{outline:none}
+:focus-visible{outline:2px solid var(--accent,#1F5AE0);outline-offset:2px;border-radius:6px}
+
+/* ---------- 自绘标题栏 ---------- */
+.titlebar{
+  position:relative;
+  flex:0 0 40px;height:40px;
+  display:flex;align-items:stretch;justify-content:space-between;
+  background:var(--bg,#F6F5F2);
+  border-bottom:1px solid var(--paper-line,#E7E3DC);
+  user-select:none;
+}
+.titlebar-drag{
+  flex:1;min-width:0;
+  display:flex;align-items:center;gap:9px;
+  padding:0 10px 0 15px;
+  cursor:default;
+}
+.tb-mark{
+  width:16px;height:16px;flex:none;display:block;
+  fill:none;stroke:currentColor;stroke-width:1.35;
+  stroke-linecap:round;stroke-linejoin:round;
+  color:var(--ink,#1C1B19);
+}
+.tb-name{
+  font-size:12.5px;font-weight:600;letter-spacing:.005em;
+  color:var(--ink,#1C1B19);white-space:nowrap;
+}
+.tb-div{width:1px;height:12px;flex:none;background:var(--paper-line-strong,#D8D3CA);margin:0 3px}
+
+/* 窗口按钮：拖动区之外，永远可点 */
+.wctl{
+  display:flex;align-items:stretch;flex:none;
+  position:relative;z-index:50;
+}
+.wbtn{
+  width:46px;height:40px;padding:0;
+  display:flex;align-items:center;justify-content:center;
+  border:0;border-radius:0;background:transparent;
+  color:var(--ink-2,#5F5B54);
+  transition:background var(--t,160ms) var(--ease,ease),color var(--t,160ms) var(--ease,ease),
+             transform 180ms var(--ease-spring,cubic-bezier(.34,1.42,.64,1));
+}
+.wbtn .ico{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.2;
+  transition:transform 180ms var(--ease-spring,cubic-bezier(.34,1.42,.64,1))}
+.wbtn:hover{background:#ECE9E3;color:var(--ink,#1C1B19)}
+.wbtn:active{background:#E2DED7;transform:scale(.94)}
+.wbtn:active .ico{transform:scale(.86)}
+.wbtn-close:hover{background:#C42B1C;color:#fff}
+.wbtn-close:active{background:#AC2417;color:#fff}
+.wbtn:focus-visible{outline-offset:-2px;border-radius:0}
+
+.titlebar.is-blurred .tb-name,
+.titlebar.is-blurred .tb-state,
+.titlebar.is-blurred .tb-title,
+.titlebar.is-blurred .wbtn{color:var(--ink-3,#6F6A61)}
+.titlebar.is-blurred .wbtn:hover{color:var(--ink,#1C1B19)}
+.titlebar.is-blurred .tb-mark{color:var(--ink-3,#6F6A61)}
+
+body.is-maximized .titlebar-drag{padding-left:23px;padding-right:18px}
+body.is-maximized .wbtn{height:40px}
+
+/* ---------- 八向缩放抓手 ---------- */
+.resizers{position:fixed;inset:0;z-index:40;pointer-events:none}
+.rz{position:fixed;pointer-events:auto;background:transparent}
+.rz-n{top:0;left:10px;right:10px;height:5px;cursor:ns-resize}
+.rz-s{bottom:0;left:10px;right:10px;height:5px;cursor:ns-resize}
+.rz-w{left:0;top:10px;bottom:10px;width:5px;cursor:ew-resize}
+.rz-e{right:0;top:10px;bottom:10px;width:5px;cursor:ew-resize}
+.rz-nw{top:0;left:0;width:10px;height:10px;cursor:nwse-resize}
+.rz-ne{top:0;right:0;width:10px;height:10px;cursor:nesw-resize}
+.rz-sw{bottom:0;left:0;width:10px;height:10px;cursor:nesw-resize}
+.rz-se{bottom:0;right:0;width:10px;height:10px;cursor:nwse-resize}
+body.is-maximized .resizers{display:none}

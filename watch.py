@@ -57,16 +57,51 @@ import hotwin                                                        # noqa: E40
 VERBOSE = "--verbose" in sys.argv
 ONCE = "--once" in sys.argv
 NO_TRAY = "--no-tray" in sys.argv
-MUTEX_NAME = "Local\\WinUpdReportWatch"
+MUTEX_NAME = hotwin.WATCH_MUTEX
 ERROR_ALREADY_EXISTS = 183
-HEARTBEAT_SECONDS = 30      # 心跳写这么勤就够了，不必每 5 秒写一次盘
+# 心跳写这么勤就够了：界面判断在线的阈值是 90 秒，够容忍几次写盘重试。
+# 关键点：心跳由**独立线程**写，所以主循环正在抓网页/等 AI 时也不会掉线。
+HEARTBEAT_SECONDS = 10
 FLUSH_SECONDS = 60          # 隔多久看一眼有没有攒着的通知要补发
 NO_WINDOW = 0x08000000
 
 # 托盘线程读这个字典来决定菜单文字和悬停提示。主循环每一轮整体更新，
 # 读的一方拿到的要么是旧的要么是新的，不会读到写了一半的状态。
 STATE = {"mode": "normal", "last_check": "", "game_exe": "",
-         "interval": 5, "silent": False}
+         "interval": 5, "silent": False, "activity": ""}
+
+# 心跳快照 + 写盘线程。主循环只更新快照（毫秒级），落盘交给线程，
+# 这样 AI 生成报告要几分钟时，界面/托盘仍然显示"正在生成报告"而不是"后台已停止"。
+_HB_LOCK = threading.Lock()
+_HB_DATA = {}
+_HB_STOP = threading.Event()
+
+
+def _hb_update(data=None, **kw):
+    with _HB_LOCK:
+        if isinstance(data, dict):
+            _HB_DATA.update(data)
+        if kw:
+            _HB_DATA.update(kw)
+
+
+def _hb_snapshot():
+    with _HB_LOCK:
+        return dict(_HB_DATA)
+
+
+def _hb_write():
+    snap = _hb_snapshot()
+    snap["last_tick"] = dt.datetime.now().isoformat(timespec="seconds")
+    save_watch(snap)
+
+
+def _hb_loop():
+    while not _HB_STOP.wait(HEARTBEAT_SECONDS):
+        try:
+            _hb_write()
+        except Exception:
+            pass
 
 # 托盘实例。菜单动作（比如「设置界面没起来」时弹个气泡）要用到它，
 # 所以放在模块级；没挂托盘时就是 None。
@@ -216,9 +251,29 @@ def _init_gui_ipc():
     _GUI_SHOW = hotwin.create_event(hotwin.GUI_SHOW_EVENT)
 
 
+def _ui_exe():
+    """新的 WPF 设置界面路径；找不到返回空串（回退旧界面）。"""
+    here = (os.path.dirname(os.path.abspath(sys.executable)) if is_frozen()
+            else BASE_DIR)
+    cands = [os.path.join(here, "WinUpdReport.UI.exe")]
+    if not is_frozen():
+        cands.insert(0, os.path.join(BASE_DIR, "ui", "WinUpdReport.UI",
+                                     "bin", "Release", "net48", "WinUpdReport.UI.exe"))
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    return ""
+
+
 def _gui_cmd():
+    ui = _ui_exe()
+    if ui:
+        cmd = [ui]
+        if not is_frozen():
+            cmd += ["--data-dir", BASE_DIR]
+        return cmd
     if is_frozen():
-        return [sys.executable]
+        return [sys.executable, "--legacy-gui"]
     return [_pythonw(), os.path.join(BASE_DIR, "gui.py")]
 
 
@@ -275,6 +330,9 @@ def tray_menu():
         {"id": "", "label": f"上次问官方：{st.get('last_check') or '还没问过'}",
          "enabled": False},
     ]
+    if st.get("activity"):
+        items.append({"id": "", "enabled": False,
+                      "label": "正在：" + str(st["activity"])[:48]})
     if st.get("game_exe"):
         items.append({"id": "", "enabled": False,
                       "label": "全屏的程序：" + os.path.basename(st["game_exe"])})
@@ -390,6 +448,8 @@ def show_status():
     print(f"  上次有新版本：{w.get('last_change') or '还没有过'}")
     print(f"  检查间隔  ：每 {w.get('interval_minutes')} 分钟")
     print(f"  托盘图标  ：{'已挂上' if w.get('tray') else '没有（不影响检测）'}")
+    if w.get("activity"):
+        print(f"  正在做    ：{w.get('activity')}")
     print(f"  累计      ：问了 {w.get('checks')} 次，出错 {w.get('errors')} 次")
     if w.get("last_result"):
         print(f"  最近结果  ：{w.get('last_result')}")
@@ -461,7 +521,7 @@ def main():
 
     next_poll = 0.0                 # 0 = 立刻先查一次（登录后正好补上关机期间的变化）
     next_flush = 0.0
-    last_hb = 0.0
+    next_tray_retry = 0.0
     last_tip = ""
     last_check = ""
     last_change = ""
@@ -472,6 +532,20 @@ def main():
     silent_until = 0.0              # 设置界面/托盘里「静默 2 小时」的截止时间
     ticks = checks = errcount = 0
     quit_reason = ""
+
+    # ---- 心跳线程：主循环在调 AI/抓网页时也保持在线状态 ----
+    _hb_update({
+        "pid": os.getpid(),
+        "started": started.isoformat(timespec="seconds"),
+        "last_check": "", "last_change": "", "mode": "normal", "game_exe": "",
+        "interval_minutes": max(1, int(cfg.get("watch_interval_minutes") or 5)),
+        "tray": bool(tray is not None and tray.alive),
+        "ticks": 0, "checks": 0, "errors": 0,
+        "last_result": "", "manual_until": "", "activity": "",
+    })
+    hb_thread = threading.Thread(target=_hb_loop, name="watch-heartbeat", daemon=True)
+    hb_thread.start()
+    _hb_write()
 
     try:
         while True:
@@ -520,7 +594,6 @@ def main():
                     clear_streak = 0
                     if not in_game:
                         in_game = True
-                        last_hb = 0
                         say(f"进入安静模式：{game_exe} 正在全屏。"
                             f"这段时间不联网、不调 AI、不通知。")
                 else:
@@ -532,7 +605,6 @@ def main():
                             game_exe = ""
                             clear_streak = 0
                             next_poll = 0     # 补查：玩游戏期间可能发了新版本
-                            last_hb = 0
                             say("退出全屏，立刻补查一次")
                     else:
                         clear_streak = 0
@@ -551,23 +623,34 @@ def main():
                         try:
                             res = checker.run_check(
                                 cfg, state, cond=cond, quiet=True, label="哨兵",
-                                should_notify=lambda: not busy_now(cfg, silent_until))
-                            checks += 1
-                            if res.get("errors"):
-                                errcount += len(res["errors"])
-                                last_result = res["errors"][-1]
-                                say("这轮有问题：" + last_result, "ERROR")
-                            elif res.get("changed"):
-                                last_change = last_check
-                                last_result = f"{len(res['updates'])} 条线有新版本"
-                                say("已发现新版本并处理：" + last_result)
+                                should_notify=lambda: not busy_now(cfg, silent_until),
+                                wait_lock_seconds=0,
+                                status_cb=lambda text: _hb_update(activity=text))
+                            if res.get("skip") == "另一个检测正在进行":
+                                # 设置界面正在手动检测：不跟它抢，半分钟后再试
+                                next_poll = time.time() + 30
+                                last_result = "手动检测进行中，稍后自动重试"
+                                say("手动检测正在进行，这轮先跳过（半分钟后再试）",
+                                    "WARN")
                             else:
-                                last_result = ""     # 没变化：不写日志、不刷屏
+                                checks += 1
+                                if res.get("errors"):
+                                    errcount += len(res["errors"])
+                                    last_result = res["errors"][-1]
+                                    say("这轮有问题：" + last_result, "ERROR")
+                                elif res.get("changed"):
+                                    last_change = last_check
+                                    last_result = f"{len(res['updates'])} 条线有新版本"
+                                    say("已发现新版本并处理：" + last_result)
+                                else:
+                                    last_result = ""     # 没变化：不写日志、不刷屏
                         except Exception as e:
                             errcount += 1
                             last_result = f"{type(e).__name__}: {e}"
                             say("这轮检测抛异常：\n" + traceback.format_exc(),
                                 "ERROR")
+                        finally:
+                            _hb_update(activity="")
 
                     # 攒着的通知（静默时段或游戏期间留下的）定期补发
                     if now >= next_flush:
@@ -579,7 +662,33 @@ def main():
                         except Exception:
                             pass
 
-                # ---- 第 3 步：刷新托盘提示 + 写心跳 ----
+                # ---- 第 3 步：托盘（样式 / 提示 / 挂了自动重挂）----
+                if not NO_TRAY and (tray is None or not tray.alive):
+                    # 托盘线程偶发挂掉（Shell_NotifyIcon 失败 / explorer 重启）时，
+                    # 以前图标就永久消失了；这里每 30 秒尝试重建一次。
+                    if time.monotonic() >= next_tray_retry:
+                        next_tray_retry = time.monotonic() + 30
+                        if tray is not None:
+                            say("托盘图标不在了，尝试重新挂上", "WARN")
+                        try:
+                            want = ((cfg.get("tray_style") or "").strip()
+                                    or tray_style or tray_mod.load_styles()[0])
+                            new_tray = tray_mod.Tray(
+                                tray_mod.icon_path(want),
+                                menu_provider=tray_menu,
+                                on_default=open_settings, on_action=tray_action,
+                                tip="win升级报告 · 正在启动")
+                            if new_tray.start():
+                                tray = new_tray
+                                TRAY = tray
+                                tray_style = want
+                                say("托盘图标已重新挂上")
+                            else:
+                                say(f"重新挂托盘失败：{new_tray._error or '未知原因'}",
+                                    "WARN")
+                        except Exception as e:
+                            say(f"重新挂托盘出错：{type(e).__name__}: {e}", "WARN")
+
                 if tray is not None and tray.alive:
                     # 样式被改过就现场换图标。换失败也记下来，免得每轮重试刷屏。
                     want = (cfg.get("tray_style") or "").strip()
@@ -596,42 +705,43 @@ def main():
                         mode_txt = "全屏中（先不打扰你）"
                     else:
                         mode_txt = "运行中"
+                    activity = str(_hb_snapshot().get("activity") or "")
                     tip = (f"win升级报告 · {mode_txt}"
                            f"　上次检查 {last_check[11:19] if last_check else '—'}"
                            f"　每 {interval // 60} 分钟一次")
+                    if activity:
+                        tip += f"　{activity}"
                     if tip != last_tip:
                         last_tip = tip
                         tray.set_tip(tip)
 
+                mode_now = ("game" if in_game
+                            else ("paused" if not enabled else "normal"))
                 STATE.update({
-                    "mode": ("game" if in_game
-                             else ("paused" if not enabled else "normal")),
+                    "mode": mode_now,
                     "last_check": last_check,
                     "game_exe": game_exe,
                     "interval": interval // 60,
                     "silent": now < silent_until,
+                    "activity": str(_hb_snapshot().get("activity") or ""),
                 })
 
-                if last_hb == 0 or now - last_hb >= HEARTBEAT_SECONDS:
-                    last_hb = now
-                    save_watch({
-                        "pid": os.getpid(),
-                        "started": started.isoformat(timespec="seconds"),
-                        "last_tick": dt.datetime.now().isoformat(timespec="seconds"),
-                        "last_check": last_check,
-                        "last_change": last_change,
-                        "mode": ("game" if in_game
-                                 else ("paused" if not enabled else "normal")),
-                        "game_exe": game_exe,
-                        "interval_minutes": interval // 60,
-                        "tray": bool(tray is not None and tray.alive),
-                        "ticks": ticks, "checks": checks, "errors": errcount,
-                        "last_result": last_result[:300],
-                        "manual_until": (
-                            dt.datetime.fromtimestamp(silent_until)
-                            .isoformat(timespec="seconds")
-                            if now < silent_until else ""),
-                    })
+                # 心跳交给后台线程定时落盘（它同时负责长任务期间的"还在跑"）。
+                # 这里只更新快照，毫秒级，不阻塞主循环。
+                _hb_update({
+                    "last_check": last_check,
+                    "last_change": last_change,
+                    "mode": mode_now,
+                    "game_exe": game_exe,
+                    "interval_minutes": interval // 60,
+                    "tray": bool(tray is not None and tray.alive),
+                    "ticks": ticks, "checks": checks, "errors": errcount,
+                    "last_result": last_result[:300],
+                    "manual_until": (
+                        dt.datetime.fromtimestamp(silent_until)
+                        .isoformat(timespec="seconds")
+                        if now < silent_until else ""),
+                })
 
                 if ONCE:
                     say(f"--once：跑了 1 轮（第 {ticks} 次醒，检测 {checks} 次，"
@@ -652,6 +762,13 @@ def main():
                     pass
                 time.sleep(10)
     finally:
+        # 先停心跳线程，否则它可能在下面写完「已停止」之后又补一个「运行中」。
+        _HB_STOP.set()
+        try:
+            if hb_thread.is_alive():
+                hb_thread.join(3)
+        except Exception:
+            pass
         # 哨兵要走了：让还藏在后台的设置窗口也退掉（窗口正开着的话保持不动，
         # 用户还能把这次操作做完；GUI 那边会看到哨兵没了，关窗时自动退出）。
         if tray is not None:
@@ -662,9 +779,13 @@ def main():
         # 把心跳写清楚，免得界面一直显示「运行中」（last_tick 空了就等于离线）
         try:
             w = load_watch()
+            # load_watch 会临时塞 online / stale_seconds，别写回心跳文件里
+            w.pop("online", None)
+            w.pop("stale_seconds", None)
             w["last_tick"] = ""
             w["mode"] = "stopped"
             w["tray"] = False
+            w["activity"] = ""
             save_watch(w)
         except Exception:
             pass
@@ -683,3 +804,4 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(9)
+

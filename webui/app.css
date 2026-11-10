@@ -242,8 +242,7 @@ body.personalized.pg-dark .content::-webkit-scrollbar-thumb{
 }
 *::-webkit-scrollbar-thumb:hover{background:#C7C1B6;background-clip:padding-box}
 
-:focus{outline:none}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+/* :focus / :focus-visible 的基础样式在 chrome.css（两个窗口共用） */
 
 /* ---------- 图标 ---------- */
 .icon-defs{position:absolute;width:0;height:0;overflow:hidden}
@@ -274,32 +273,7 @@ body.personalized.pg-dark .content::-webkit-scrollbar-thumb{
 .app{display:flex;flex-direction:column;height:100%;min-height:0}
 .app-body{display:flex;flex:1;min-height:0;min-width:0;overflow:hidden}
 
-/* ---------- 自绘标题栏 ---------- */
-.titlebar{
-  position:relative;
-  flex:0 0 40px;height:40px;
-  display:flex;align-items:stretch;justify-content:space-between;
-  background:var(--bg);
-  border-bottom:1px solid var(--paper-line);
-  user-select:none;
-}
-.titlebar-drag{
-  flex:1;min-width:0;
-  display:flex;align-items:center;gap:9px;
-  padding:0 10px 0 15px;
-  cursor:default;
-}
-.tb-mark{
-  width:16px;height:16px;flex:none;display:block;
-  fill:none;stroke:currentColor;stroke-width:1.35;
-  stroke-linecap:round;stroke-linejoin:round;
-  color:var(--ink);
-}
-.tb-name{
-  font-size:12.5px;font-weight:600;letter-spacing:.005em;
-  color:var(--ink);white-space:nowrap;
-}
-.tb-div{width:1px;height:12px;flex:none;background:var(--paper-line-strong);margin:0 3px}
+/* ---------- 自绘标题栏（外壳样式在 chrome.css，两个窗口共用） ---------- */
 .tb-state{
   display:flex;align-items:center;gap:6px;
   min-width:0;font-size:12px;color:var(--ink-3);
@@ -308,48 +282,14 @@ body.personalized.pg-dark .content::-webkit-scrollbar-thumb{
 .tb-state .dot.is-live::after{display:none}
 .tb-state-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-/* 窗口按钮：拖动区之外，永远可点 */
-.wctl{
-  display:flex;align-items:stretch;flex:none;
-  position:relative;z-index:50;
+/* ---------- 连接状态提示（后台接口超时/断线时显示） ---------- */
+.conn-hint{
+  display:inline-flex;align-items:center;gap:5px;
+  font-size:11.5px;color:var(--warn);
+  max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.wbtn{
-  width:46px;height:40px;padding:0;
-  display:flex;align-items:center;justify-content:center;
-  border:0;border-radius:0;background:transparent;
-  color:var(--ink-2);
-  transition:background var(--t) var(--ease),color var(--t) var(--ease),
-             transform 180ms var(--ease-spring);
-}
-.wbtn .ico{width:15px;height:15px;stroke-width:1.2;transition:transform 180ms var(--ease-spring)}
-.wbtn:hover{background:#ECE9E3;color:var(--ink)}
-.wbtn:active{background:#E2DED7;transform:scale(.94)}
-.wbtn:active .ico{transform:scale(.86)}
-.wbtn-close:hover{background:#C42B1C;color:#fff}
-.wbtn-close:active{background:#AC2417;color:#fff}
-.wbtn:focus-visible{outline-offset:-2px;border-radius:0}
+.conn-hint.is-bad{color:var(--bad)}
 
-.titlebar.is-blurred .tb-name,
-.titlebar.is-blurred .tb-state,
-.titlebar.is-blurred .wbtn{color:var(--ink-3)}
-.titlebar.is-blurred .wbtn:hover{color:var(--ink)}
-.titlebar.is-blurred .tb-mark{color:var(--ink-3)}
-
-body.is-maximized .titlebar-drag{padding-left:23px;padding-right:18px}
-body.is-maximized .wbtn{height:40px}
-
-/* ---------- 八向缩放抓手 ---------- */
-.resizers{position:fixed;inset:0;z-index:40;pointer-events:none}
-.rz{position:fixed;pointer-events:auto;background:transparent}
-.rz-n{top:0;left:10px;right:10px;height:5px;cursor:ns-resize}
-.rz-s{bottom:0;left:10px;right:10px;height:5px;cursor:ns-resize}
-.rz-w{left:0;top:10px;bottom:10px;width:5px;cursor:ew-resize}
-.rz-e{right:0;top:10px;bottom:10px;width:5px;cursor:ew-resize}
-.rz-nw{top:0;left:0;width:10px;height:10px;cursor:nwse-resize}
-.rz-ne{top:0;right:0;width:10px;height:10px;cursor:nesw-resize}
-.rz-sw{bottom:0;left:0;width:10px;height:10px;cursor:nesw-resize}
-.rz-se{bottom:0;right:0;width:10px;height:10px;cursor:nwse-resize}
-body.is-maximized .resizers{display:none}
 
 
 /* ---------- 侧边栏 ---------- */
@@ -1323,7 +1263,7 @@ select.input{
   min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 .reader-actions{display:flex;align-items:center;gap:6px;flex:none}
-.reader-actions .btn{height:28px;font-size:12px}
+.reader-actions .btn{height:28px;font-size:12.5px}
 .reader-body{position:relative;flex:1;min-height:0;background:var(--surface)}
 .reader-frame-w{position:absolute;inset:0}
 #readerFrame{width:100%;height:100%;border:0;background:#fff}

@@ -130,7 +130,11 @@ def _our_temp_dirs():
 
 
 def _autostart_state():
-    """开机自启装了没有。返回 (有没有装, 装的哪种)。"""
+    """开机自启装了没有、装得对不对。返回 (有没有装, 说明)。
+
+    判断计划任务时不再在整段文本里搜「未安装」（查询失败/只剩旧任务都会误判），
+    而是直接解析哨兵任务那一行；顺带看看「限时」是不是不限时。
+    """
     # 延迟导入 gui：它反过来要导入本模块，模块级互相 import 会成环。
     try:
         import gui
@@ -140,8 +144,10 @@ def _autostart_state():
         pass
     try:
         import gui
-        txt = gui.task_info() or ""
-        if "未安装" not in txt:
+        installed, limit_ok = gui.watch_task_installed()
+        if installed and not limit_ok:
+            return True, "计划任务（限时设置不对，建议重新安装一次）"
+        if installed:
             return True, "计划任务"
     except Exception:
         pass
@@ -159,9 +165,24 @@ def check_all(fix=True):
     def add(name, status, msg):
         res.append({"name": name, "status": status, "msg": msg})
 
-    # 1) 数据目录能不能写 —— 写不进去后面全是白搭
+    # 1) 数据目录能不能写、配置文件能不能读 —— 写不进去后面全是白搭
     if _can_write(LOG_DIR) and _can_write(REPORT_DIR):
-        add("存报告的位置", "ok", "能正常读写")
+        bad = []
+        for p in (CONFIG_PATH, os.path.join(BASE_DIR, "state.json")):
+            if not os.path.exists(p):
+                continue
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    import json as _json
+                    _json.load(f)
+            except Exception:
+                bad.append(os.path.basename(p))
+        if bad:
+            add("存报告的位置", "warn",
+                f"能正常读写，但 {'、'.join(bad)} 内容坏了（启动时会尝试从 .bak 自动恢复；"
+                f"如果某项设置丢了，重新填一次保存即可）。")
+        else:
+            add("存报告的位置", "ok", "能正常读写")
     else:
         add("存报告的位置", "fail",
             f"写不进去：{BASE_DIR}。检查一下这个文件夹的权限，或者杀软是不是拦了。")

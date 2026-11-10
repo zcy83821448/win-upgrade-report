@@ -14,6 +14,7 @@
 源码运行时可以直接用 python app.py <同样的参数>。
 """
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +32,45 @@ def out(*parts):
     except Exception:
         pass
 
+
+
+def _ui_exe():
+    """新的 WPF 设置界面（WinUpdReport.UI.exe）。找不到就返回空串。"""
+    frozen = bool(getattr(sys, "frozen", False))
+    here = (os.path.dirname(os.path.abspath(sys.executable)) if frozen
+            else os.path.dirname(os.path.abspath(__file__)))
+    cands = [os.path.join(here, "WinUpdReport.UI.exe")]
+    if not frozen:
+        cands.insert(0, os.path.join(here, "ui", "WinUpdReport.UI",
+                                     "bin", "Release", "net48", "WinUpdReport.UI.exe"))
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+def _launch_ui(rest):
+    """优先打开新的 WPF 界面；返回 None 表示没找到，交给旧界面兜底。"""
+    ui = _ui_exe()
+    if not ui:
+        return None
+    try:
+        import config
+        args = [ui]
+        if not config.is_frozen():
+            args += ["--data-dir", config.BASE_DIR]
+        args += list(rest or [])
+        flags = 0
+        if os.name == "nt":
+            flags = 0x08000000          # CREATE_NO_WINDOW
+        subprocess.Popen(args, cwd=os.path.dirname(ui), close_fds=True,
+                         creationflags=flags,
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return 0
+    except Exception:
+        return None
 
 def _native_error(title, text):
     """没有控制台时的报错窗口：直接调 Windows 原生 MessageBox。
@@ -127,9 +167,22 @@ def _selftest():
     except Exception as e:
         out("  pywebview   : 不可用 ->", e)
     ui_dir = config.resource_path("webui")
-    for name in ("index.html", "app.css", "app.js"):
+    for name in ("index.html", "app.css", "app.js",
+                 "chrome.css", "chrome.js", "reader.css"):
         p = os.path.join(ui_dir, name)
         out(f"  界面资源 {name:10s}: {'OK  ' if os.path.exists(p) else '缺失'} {p}")
+    ui = _ui_exe()
+    out("  WPF 设置界面:", ("OK  " + ui) if ui else "缺失（会自动回退旧界面）")
+    try:
+        import winreg
+        rel = winreg.QueryValueEx(
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"),
+            "Release")[0]
+        out("  .NET 4.8    :", ("已安装 Release=" + str(rel)) if int(rel) >= 528040
+            else "低于 4.8（WPF 界面可能打不开）")
+    except Exception as e:
+        out("  .NET 4.8    : 查询失败 ->", e)
     try:
         import winreg
         found = ""
@@ -241,6 +294,10 @@ def main():
         sys.argv = [argv0] + rest
         import watch
         return watch.main()
+    if mode in ("--ui-service", "ui-service"):
+        # WPF 界面的后台服务进程（无窗口）。界面会自动拉起它。
+        import ui_service
+        return ui_service.main(rest)
     if mode in ("--task", "task"):
         return _task_mode(rest)
     if mode in ("--view", "view"):
@@ -252,7 +309,11 @@ def main():
         import checker
         return checker.main()
 
-    # 默认：设置界面
+    # 默认：设置界面（新 WPF 界面优先；--legacy-gui 强制旧界面）
+    if "--legacy-gui" not in rest:
+        rc = _launch_ui([a for a in rest if a != "--legacy-gui"])
+        if rc is not None:
+            return rc
     sys.argv = [argv0] + rest
     import gui
     return gui.main()
@@ -277,3 +338,6 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
+
+
+

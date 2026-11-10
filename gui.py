@@ -24,7 +24,7 @@ import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (load_config, save_config, load_state, save_state, channel_state,   # noqa: E402
-                    resolve_api_key, mask_key, BASE_DIR, REPORT_DIR, LOG_DIR,
+                    update_state, resolve_api_key, mask_key, BASE_DIR, REPORT_DIR, LOG_DIR,
                     DEFAULTS, resource_path, is_frozen, app_exe, child_env,
                     load_watch, request_check_now, request_exit, patch_config)
 import channels as ch_mod                                                   # noqa: E402
@@ -249,6 +249,34 @@ def task_info():
     return "\n".join(lines) or "未安装计划任务"
 
 
+def watch_task_installed():
+    """只判断「哨兵计划任务」装没装，返回 (是否安装, 限时是否合规)。
+
+    以前 selfcheck 是拿 task_info() 的整段文本搜「未安装」两个字判断的：
+    查询失败、或者只剩旧的每日任务时都会误判成「已设置」。
+    """
+    try:
+        raw = (ps_task("query").stdout or "").strip()
+    except Exception:
+        return False, True
+    installed = False
+    limit_ok = True
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if not ln.startswith(WATCH_TASK_NAME + ":"):
+            continue
+        rest = ln.split(":", 1)[1].strip()
+        if rest == "NONE":
+            return False, True
+        installed = True
+        m = re.search(r"LIMIT=([^;]*)$", rest)
+        if m:
+            limit = m.group(1).strip()
+            limit_ok = limit in ("", "PT0S", "P0D")
+        break
+    return installed, limit_ok
+
+
 def startup_link():
     return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
                         "Start Menu", "Programs", "Startup", "win升级报告.lnk")
@@ -369,69 +397,28 @@ def _normalize_check_time(spec):
 
 
 _REPORT_NAME_RE = re.compile(r"更新报告_([0-9]+(?:-[0-9]+)*)_(\d{4}-\d{2}-\d{2})")
-_REPORT_EMBED_CSS = """<style id="winupd-embed">
-/* 这份样式是设置界面在 iframe 里内嵌报告时注入的：去掉页面自己的背景、留白和阴影，
-   让报告看起来是界面的一部分而不是另一个网站。 */
-html,body{background:#fff !important;padding:0 !important;margin:0 !important;color-scheme:light}
-body{color:#1C1B19 !important}
-main{box-shadow:none !important;border-radius:0 !important;max-width:560px !important;
- margin:0 auto !important;padding:24px 28px !important;background:#fff !important}
-a{color:#1F5AE0 !important}
-/* 应用内嵌字号：报告页自带的 PAGE 样式是「网页阅读」尺寸（h1 27px 等），
-   塞进窄面板后标题会被折成好几行、正文也偏大。这里整体降一档；
-   阅读器里再用 560px 的行宽上限，避免一行拉到 60 多个汉字。 */
-body{font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif !important;
- font-size:13.5px !important;line-height:1.7 !important}
-main{padding:24px 28px !important}
-h1{font-size:21px !important;line-height:1.35 !important;margin:0 0 8px !important}
-h2{font-size:16.5px !important;margin:22px 0 8px !important;padding-bottom:5px !important}
-h3{font-size:14.5px !important;margin:16px 0 6px !important}
-h4{font-size:13.5px !important}
-p,li{font-size:13.5px !important;margin:6px 0 !important}
-ul,ol{padding-left:20px !important}
-table{font-size:12.5px !important}
-code,pre{font-size:12px !important}
-blockquote{font-size:13px !important}
-/* 滚动条也走应用自己的样式，不再出现 Windows 默认的宽灰条 */
-html{scrollbar-gutter:stable}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#D8D3CA;border:3px solid #fff;
- background-clip:padding-box;border-radius:8px}
-::-webkit-scrollbar-thumb:hover{background:#C7C1B6;background-clip:padding-box}
-/* 右侧预览面板只有 300～500px：把缩进收小，正文能多放几个字。 */
-@media (max-width:620px){
- main{max-width:none !important;padding:20px 22px !important}
- h1{font-size:19px !important}
- h2{font-size:16px !important}
- p,li{font-size:13px !important;line-height:1.65 !important}
-}
-@media (prefers-color-scheme:dark){
- html,body{background:#fff !important;color:#1C1B19 !important}
- body{color:#1C1B19 !important}
- main{background:#fff !important;color:#1C1B19 !important;box-shadow:none !important}
- h1,h2,h3,h4,p,li,td,th,blockquote{color:#1C1B19 !important}
- h2{border-color:#E7E3DC !important}
- code,pre{background:#F6F5F2 !important;color:#1C1B19 !important;border-color:#E7E3DC !important}
- th{background:#FBFAF7 !important}
- th,td,hr{border-color:#E7E3DC !important}
- blockquote{background:#F4F8FF !important}
- a{color:#1F5AE0 !important}
-}
-</style>"""
-
+# 报告内嵌样式已抽到 webui/reader.css（唯一来源，见 reporter.reader_style_tag）
 
 def _inject_report_css(html):
-    """把「贴合应用内嵌」的 CSS 注入到报告 HTML 里（放在 </style> 之前，不破坏原样式）。"""
+    """把「贴合应用内嵌」的 CSS 注入到报告 HTML 里。
+
+    样式唯一来源是 webui/reader.css（和独立报告窗口、浏览器打开共用同一份）；
+    新报告在生成时已经内联过，这里检测到就不再重复注入。
+    """
     try:
+        if 'id="winupd-reader"' in html:
+            return html
+        tag = reporter.reader_style_tag()
+        if not tag:
+            return html
         low = html.lower()
         if "</style>" in low:
             i = low.rfind("</style>")
-            return html[:i] + _REPORT_EMBED_CSS + html[i:]
+            return html[:i] + tag + html[i:]
         if "</head>" in low:
             i = low.rfind("</head>")
-            return html[:i] + _REPORT_EMBED_CSS + html[i:]
-        return _REPORT_EMBED_CSS + html
+            return html[:i] + tag + html[i:]
+        return tag + html
     except Exception:
         return html
 
@@ -915,26 +902,38 @@ class GuiApi:
 
     @_guard
     def ignore_version(self, id=None):
+        """把「当前记录的版本」加进忽略列表。
+
+        ★ 必须锁内重读 state 再改，只动 ignored 一个字段：
+          以前用内存里可能几分钟前缓存的状态整份回写，会把后台刚记的
+          last_version / reports / notified_builds 覆盖回旧值——表现出来就是
+          「点了忽略，结果同一版本又生成了一份报告/又弹了一次通知」。
+        """
         cid = str(id or "").strip()
         with self._lock:
-            c = self._find_row(cid)
-            cs = ((self._state.get("channels") or {}).get(cid) or {})
-            ver = cs.get("last_version")
-            if not c:
+            if not self._find_row(cid):
                 return {"ok": False, "error": "没找到这条更新线",
                         "channels": self._channels_payload()}
+
+        def mutate(st):
+            cs = channel_state(st, cid)
+            ver = str(cs.get("last_version") or "")
             if not ver:
-                return {"ok": False, "error": "这条线还没有记录版本，没法忽略",
-                        "channels": self._channels_payload()}
-            cs = channel_state(self._state, cid)
+                raise ValueError("这条线还没有记录版本，没法忽略")
             cs["ignored"] = sorted(set([str(x) for x in (cs.get("ignored") or [])]
-                                       + [str(ver)]))
-            try:
-                save_state(self._state)
-            except Exception as e:
-                log_exception("保存忽略版本")
-                return {"ok": False, "error": f"记不进去：{e}",
-                        "channels": self._channels_payload()}
+                                       + [ver]))
+            return ver
+
+        try:
+            state, ver = update_state(mutate)
+        except ValueError as e:
+            return {"ok": False, "error": str(e), "channels": self._channels_payload()}
+        except Exception as e:
+            log_exception("保存忽略版本")
+            return {"ok": False, "error": f"记不进去：{e}",
+                    "channels": self._channels_payload()}
+        with self._lock:
+            self._state = state
             payload = self._channels_payload()
         return {"ok": True, "channels": payload,
                 "message": f"已忽略 {ver}：以后不再为这个版本生成报告"}
@@ -943,18 +942,23 @@ class GuiApi:
     def clear_ignored(self, id=None):
         cid = str(id or "").strip()
         with self._lock:
-            c = self._find_row(cid)
-            if not c:
+            if not self._find_row(cid):
                 return {"ok": False, "error": "没找到这条更新线",
                         "channels": self._channels_payload()}
-            cs = channel_state(self._state, cid)
+
+        def mutate(st):
+            cs = channel_state(st, cid)
             cs["ignored"] = []
-            try:
-                save_state(self._state)
-            except Exception as e:
-                log_exception("清除忽略列表")
-                return {"ok": False, "error": f"记不进去：{e}",
-                        "channels": self._channels_payload()}
+            return True
+
+        try:
+            state, _ = update_state(mutate)
+        except Exception as e:
+            log_exception("清除忽略列表")
+            return {"ok": False, "error": f"记不进去：{e}",
+                    "channels": self._channels_payload()}
+        with self._lock:
+            self._state = state
             payload = self._channels_payload()
         return {"ok": True, "channels": payload, "message": "已清除忽略列表"}
 
@@ -979,8 +983,10 @@ class GuiApi:
             try:
                 save_config(cfg)
             except Exception as e:
+                # retry=True 告诉前端：这是临时 IO 故障，别把待保存内容丢掉，
+                # 隔一会儿自动重试；校验类错误不带这个字段，前端会提示用户改。
                 log_exception("保存设置")
-                return {"ok": False, "error": f"保存失败：{e}"}
+                return {"ok": False, "error": f"保存失败：{e}", "retry": True}
             self._cfg = cfg
             self._state = load_state(force=True)
             try:
@@ -1042,6 +1048,11 @@ class GuiApi:
                                       if str(x).strip()]
 
         # 数值范围（与旧版 _apply() 一致）
+        # 数值范围：前端有 min/max，但手填 0 之类的浏览器不会拦截，
+        # 这里再做一次后端兜底，绝不让 0 token / 0 秒超时流到 AI 请求里。
+        def _clamp(key, lo, hi, default):
+            cfg[key] = max(lo, min(hi, _as_int(cfg.get(key), default)))
+
         cfg["watch_interval_minutes"] = max(
             1, min(1440, _as_int(cfg.get("watch_interval_minutes"), 5)))
         cfg["game_exit_hold_seconds"] = max(
@@ -1049,14 +1060,14 @@ class GuiApi:
         cfg["max_workers"] = max(1, min(16, _as_int(cfg.get("max_workers"), 4)))
         cfg["tick_seconds"] = max(2, min(60, _as_int(cfg.get("tick_seconds"), 5)))
         cfg["interval_days"] = max(1, _as_int(cfg.get("interval_days"), 1))
-        for k in ("keep_reports", "max_tokens", "request_timeout", "retries",
-                  "max_context_chars", "notify_on_error_after"):
-            if k == "notify_on_error_after":
-                cfg[k] = max(0, _as_int(cfg.get(k), 3))
-            else:
-                cfg[k] = max(0, _as_int(cfg.get(k), 0))
+        _clamp("keep_reports", 10, 5000, 200)
+        _clamp("max_tokens", 100, 8000, 1600)
+        _clamp("request_timeout", 10, 900, 60)
+        _clamp("retries", 0, 10, 2)
+        _clamp("max_context_chars", 1000, 200000, 16000)
+        _clamp("notify_on_error_after", 0, 99, 3)
         try:
-            cfg["temperature"] = float(cfg.get("temperature"))
+            cfg["temperature"] = max(0.0, min(2.0, float(cfg.get("temperature"))))
         except Exception:
             return "「随机程度」需要填数字"
         if cfg.get("detail") not in DETAIL_OPTIONS:
@@ -1117,11 +1128,14 @@ class GuiApi:
         return {"ok": True, "config": cfg, "message": msg}
 
     @_guard
-    def list_windows(self):
+    def list_windows(self, exclude_pid=None):
         """当前桌面上能加进忽略名单的窗口（含最小化的）。
 
         以前是取「前台窗口」，但用户点按钮的时候前台窗口就是设置界面自己，
         永远只能把自己加进去；所以改成列出来让用户自己挑。
+
+        exclude_pid：新版 WPF 界面是**另一个进程**（win升级报告.exe --ui-service
+        只是它的后台），它把自己的 pid 传进来，才能把设置窗口本身排除掉。
         """
         try:
             import gamesense
@@ -1129,6 +1143,9 @@ class GuiApi:
         except Exception as e:
             log_exception("枚举窗口")
             return {"ok": False, "error": f"取不到窗口列表：{e}"}
+        ui_pid = _as_int(exclude_pid, 0)
+        if ui_pid:
+            windows = [w for w in windows if _as_int(w.get("pid"), 0) != ui_pid]
         # 自己的窗口（设置界面、报告查看器）不算，免得用户把本程序加进去
         own_exes = {os.path.normcase(os.path.abspath(sys.executable))}
         windows = [w for w in windows
@@ -1139,7 +1156,10 @@ class GuiApi:
         ignored = {str(x).strip().lower() for x in (cfg.get("game_ignore") or [])
                    if str(x).strip()}
         for w in windows:
-            w["ignored"] = w["name"].lower() in ignored
+            # 名单里存的可能是程序名（旧界面），也可能是完整路径（新界面），两种都算
+            name = str(w.get("name") or "").strip().lower()
+            exe = str(w.get("exe") or "").strip().lower()
+            w["ignored"] = bool(name) and (name in ignored or exe in ignored)
         return {"ok": True, "windows": windows}
 
     # ============================================================ 个性化
@@ -1305,7 +1325,8 @@ class GuiApi:
                 online = False
         note = f"正在检测 {name}"
         if online:
-            note += "（后台监控也在跑，两边可能同时写状态）"
+            # 现在两边抢同一把「检测锁」：后台在跑就串行等它，不会互相覆盖状态。
+            note += "（后台监控在线时会和它串行执行，可能要稍等一下）"
         if not self._run_check_live(["--only", cid], note=note):
             return {"ok": False, "error": self._busy_error()}
         return {"ok": True, "started": True}
@@ -1342,9 +1363,25 @@ class GuiApi:
                 selfcheck.stop_sentinel()
             except Exception:
                 log_exception("停止后台监控")
+            # 等它真的退干净（正在写报告时可能要几十秒），别让界面刚说「已停止」
+            # 下一秒又变成「运行中」，也不要让用户马上重开时状态来回跳。
+            stopped = False
+            for _ in range(30):
+                time.sleep(0.2)
+                try:
+                    if not load_watch().get("online"):
+                        stopped = True
+                        break
+                except Exception:
+                    stopped = True
+                    break
             self._refresh_cfg()
-            return {"ok": True, "online": False,
-                    "message": "已停止后台监控，托盘图标几秒内消失。"}
+            if stopped:
+                return {"ok": True, "online": False,
+                        "message": "已停止后台监控，托盘图标已经消失。"}
+            return {"ok": True, "online": True,
+                    "message": "已通知后台停止，但它正在处理一轮检测，"
+                               "处理完会自己退出（最多再等几分钟）。"}
         if not resolve_api_key(cfg):
             return {"ok": False, "online": False,
                     "error": "先去「设置」页填一个 AI 的 Key —— 不填的话就算发现新版本也写不出中文报告。"}
@@ -1384,8 +1421,13 @@ class GuiApi:
 
     @_guard
     def test_api(self):
-        with self._lock:
-            cfg = dict(self._cfg)
+        # 用磁盘上的最新配置：刚在输入框里改完 Key/模型，自动保存可能有 400ms 防抖，
+        # 用内存里的旧配置会误报「还没填 Key」。
+        try:
+            cfg = load_config()
+        except Exception:
+            with self._lock:
+                cfg = dict(self._cfg)
         key = resolve_api_key(cfg)
         if not key:
             return {"ok": False, "error": "还没填 AI 的 Key：先在「设置」页粘贴一个再试"}
@@ -1539,8 +1581,16 @@ class GuiApi:
         wh = str(where or "desktop").strip().lower()
         if wh not in ("desktop", "startmenu"):
             wh = "desktop"
-        exe = sys.executable if FROZEN else pythonw()
-        targ = "" if FROZEN else f'"{os.path.join(BASE_DIR, "app.py")}"'
+        # 快捷方式优先指向新的 WPF 设置界面（跳过 PyInstaller 启动层，快 0.5 秒左右）
+        ui = (os.path.join(BASE_DIR, "WinUpdReport.UI.exe") if FROZEN else
+              os.path.join(BASE_DIR, "ui", "WinUpdReport.UI", "bin", "Release",
+                           "net48", "WinUpdReport.UI.exe"))
+        if os.path.exists(ui):
+            exe = ui
+            targ = "" if FROZEN else f'--data-dir "{BASE_DIR}"'
+        else:
+            exe = sys.executable if FROZEN else pythonw()
+            targ = "" if FROZEN else f'"{os.path.join(BASE_DIR, "app.py")}"'
         name = "win升级报告.lnk"
         if wh == "desktop":
             folder = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
@@ -1615,9 +1665,8 @@ class GuiApi:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     md = f.read()
                 title = os.path.splitext(os.path.basename(path))[0]
-                # render_page 内部会用 str.format，标题里的大括号要转义
-                safe_title = title.replace("{", "{{").replace("}", "}}")
-                html = mdlite.render_page(md, safe_title)
+                html = mdlite.render_page(md, title,
+                                          extra_css=reporter.reader_style_tag())
             else:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     html = f.read()
@@ -1986,9 +2035,9 @@ class GuiApi:
                 title = os.path.splitext(os.path.basename(target))[0]
                 html_path = os.path.splitext(target)[0] + ".html"
                 try:
-                    with open(html_path, "w", encoding="utf-8") as f:
-                        f.write(mdlite.render_page(
-                            md, title.replace("{", "{{").replace("}", "}}")))
+                    from config import atomic_write_text
+                    atomic_write_text(html_path, mdlite.render_page(
+                        md, title, extra_css=reporter.reader_style_tag()))
                 except Exception:
                     html_path = target
                 webbrowser.open("file:///" + os.path.abspath(html_path).replace("\\", "/"))
@@ -2104,8 +2153,14 @@ class GuiApi:
         return cfg
 
     def _persist_channels(self):
-        """线列表的启用/停用/架构/添加立刻写盘（前端是自动保存，没有「保存」按钮）。"""
-        cfg = self._cfg_with_rows(dict(self._cfg))
+        """线列表的启用/停用/架构/添加立刻写盘（前端是自动保存，没有「保存」按钮）。
+
+        先读盘上最新配置再合并内存里的行列表：后台哨兵可能刚自动收录了新频道，
+        直接拿界面启动时的旧快照写盘会把它弄丢。
+        """
+        cfg = load_config()
+        self._merge_rows_from_cfg(cfg)
+        cfg = self._cfg_with_rows(cfg)
         try:
             save_config(cfg)
         except Exception as e:
@@ -2170,6 +2225,7 @@ class GuiApi:
         return {
             "online": online,
             "mode": mode,
+            "activity": str(w.get("activity") or ""),
             "last_check": str(w.get("last_check") or ""),
             "last_change": str(w.get("last_change") or ""),
             "interval_minutes": _as_int(w.get("interval_minutes")
@@ -2509,9 +2565,12 @@ class GuiApi:
                 return
             if rc == 0:
                 text = "检测完成。有更新的话报告和通知已经发出去了。"
+            elif rc == 3:
+                text = ("后台正在跑另一轮检测，这次手动检测已跳过（不会重复调 AI）；"
+                        "稍等一会儿再看「日志与诊断」里的结果。")
             else:
                 text = f"检测结束了，但退出码是 {rc}，去「日志与诊断」看看上面的输出"
-            self._push_event({"type": "done", "kind": "check", "ok": rc == 0,
+            self._push_event({"type": "done", "kind": "check", "ok": rc in (0, 3),
                               "text": text})
             with self._lock:
                 new_reports = bool(self._report_keys() - before)
@@ -2522,6 +2581,26 @@ class GuiApi:
 
         self._run_in_thread("检测", work, done)
         return True
+
+
+def _native_message(title, text, url=""):
+    """没有控制台时的原生中文提示。
+
+    url 非空时用「是/否」对话框：点「是」打开下载页（用于缺 WebView2 这种
+    README 里承诺要友好提示、但以前直接把英文 traceback 甩给用户的场景）。
+    """
+    try:
+        import ctypes
+        if url:
+            r = ctypes.windll.user32.MessageBoxW(None, str(text), str(title),
+                                                 0x04 | 0x40)   # MB_YESNO | INFO
+            if r == 6:                                           # IDYES
+                webbrowser.open(url)
+        else:
+            ctypes.windll.user32.MessageBoxW(None, str(text), str(title), 0x40)
+        return True
+    except Exception:
+        return False
 
 
 # ================================================================== 入口
@@ -2542,12 +2621,29 @@ def main():
 
     api = None
     try:
-        import webview                      # 放在函数里：import gui 时不加载界面依赖
-
-        api = GuiApi()
         index_path = resource_path(os.path.join("webui", "index.html"))
         if not os.path.exists(index_path):
-            write_error_line(f"界面文件不存在：{index_path}")
+            msg = ("界面文件缺失，设置窗口打不开。\n\n"
+                   f"缺失的是：\n{index_path}\n\n"
+                   "请不要把 exe 单独拖出来；把整个「win升级报告」文件夹重新解压一次即可。\n"
+                   "（后台监控不需要界面，不受影响。）")
+            write_error_line(msg)
+            _native_message("win升级报告 · 界面文件缺失", msg)
+            return 1
+
+        try:
+            import webview                  # 放在函数里：import gui 时不加载界面依赖
+        except Exception:
+            write_error_line("导入 webview 失败\n" + traceback.format_exc())
+            _native_message(
+                "win升级报告 · 界面组件缺失",
+                "设置窗口需要的界面组件没有装上。\n\n"
+                "请确认没有把程序文件夹里的 _internal 目录删掉；"
+                "重新解压一次完整的绿色版即可。\n"
+                "（后台监控不需要界面，不受影响。）")
+            return 1
+
+        api = GuiApi()
         window = webview.create_window(
             APP_TITLE,
             url=index_path,
@@ -2581,8 +2677,28 @@ def main():
         except Exception:
             pass
         icon = resource_path("icon.ico")
-        webview.start(gui="edgechromium", private_mode=True,
-                      icon=icon if os.path.exists(icon) else None)
+        try:
+            webview.start(gui="edgechromium", private_mode=True,
+                          icon=icon if os.path.exists(icon) else None)
+        except Exception:
+            text = traceback.format_exc()
+            write_error_line("设置窗口启动失败\n" + text)
+            low = text.lower()
+            if "webview2" in low or ("edge" in low and "runtime" in low):
+                _native_message(
+                    "win升级报告 · 需要 WebView2",
+                    "设置窗口需要 Microsoft Edge WebView2 运行时。\n\n"
+                    "Win11 和较新的 Win10 一般自带；这台机器上似乎没有装（或装坏了）。\n"
+                    "点「是」打开微软的下载页，装完再打开本程序即可。\n\n"
+                    "（后台监控不依赖它，不受影响。）",
+                    url="https://developer.microsoft.com/microsoft-edge/webview2/")
+            else:
+                _native_message(
+                    "win升级报告 · 设置窗口没能打开",
+                    "设置窗口启动失败了。\n\n"
+                    f"详细原因已经写进日志：\n{LOG_DIR}\\gui_error.log\n\n"
+                    "可以先点左侧栏/托盘里的「体检并自动修复」，或打开程序文件夹重试。")
+            return 1
     finally:
         if api is not None:
             api._close_show_handle()
@@ -2592,3 +2708,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

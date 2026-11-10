@@ -139,14 +139,16 @@ hr{{border:none;border-top:1px solid #e6e8eb;margin:26px 0}}
  box-shadow:none}} h2{{border-color:#33373d}} code,pre{{background:#2a2d32;
  border-color:#33373d}} th{{background:#2a2d32}} th,td{{border-color:#33373d}}
  hr{{border-color:#33373d}} blockquote{{background:#1d2735}}}}
-</style></head><body><main>
+</style>
+{extra_css}
+</head><body><main>
 {body}
 </main></body></html>
 """
 
 
-def render_page(md, title="Windows 更新报告"):
-    return PAGE.format(title=_esc(title), body=to_html(md))
+def render_page(md, title="Windows 更新报告", extra_css=""):
+    return PAGE.format(title=_esc(title), body=to_html(md), extra_css=extra_css)
 
 
 EXTRA_CSS = """
@@ -168,4 +170,4 @@ def render_raw(body_html, title="Windows 更新报告"):
     """直接用已经写好的 HTML 作为正文（用于总览页这类自己拼 HTML 的场景）。"""
     extra = EXTRA_CSS.replace("{", "{{").replace("}", "}}")
     return PAGE.replace("</style>", extra + "</style>").format(
-        title=_esc(title), body=body_html)
+        title=_esc(title), body=body_html, extra_css="")

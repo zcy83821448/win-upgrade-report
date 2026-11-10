@@ -36,14 +36,15 @@ import concurrent.futures
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import (load_config, save_config, load_state, save_state,      # noqa: E402
-                    channel_state, resolve_api_key, ensure_dirs,
+from config import (load_config, load_state, save_state, channel_state,   # noqa: E402
+                    merge_channels, resolve_api_key, ensure_dirs,
                     REPORT_DIR, LOG_DIR)
 import channels as ch_mod                                                  # noqa: E402
 import source                                                              # noqa: E402
 import deepseek_api                                                        # noqa: E402
 import reporter                                                            # noqa: E402
 import notify                                                              # noqa: E402
+import hotwin                                                              # noqa: E402
 
 LOG_PATH = os.path.join(LOG_DIR, "checker.log")
 MAX_LOG_BYTES = 1024 * 1024
@@ -65,10 +66,28 @@ def log(msg, level="INFO"):
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > MAX_LOG_BYTES:
             with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
                 tail = f.read()[-MAX_LOG_BYTES // 2:]
-            with open(LOG_PATH, "w", encoding="utf-8") as f:
-                f.write("=== 日志已截断 ===\n" + tail)
+            # 原子替换，避免界面正在读日志时读到写了一半的内容
+            from config import atomic_write_text
+            atomic_write_text(LOG_PATH, "=== 日志已截断 ===\n" + tail)
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------ 检测互斥
+# 手动「只检测这条线」是另一个进程；后台哨兵也随时可能开始检测。两边同时
+# 跑会重复调 AI、互相覆盖 state.json（旧版本界面自己都提示「两边可能同时写状态」）。
+# 现在两边都先抢同一个跨进程互斥体：哨兵抢不到就跳过这一轮，手动检测会等一小会儿。
+CHECK_MUTEX = hotwin.CHECK_MUTEX
+
+
+def _status(cb, text):
+    """把「当前在干什么」回传给哨兵写进心跳，界面就能显示"正在生成报告"。"""
+    if not cb:
+        return
+    try:
+        cb(text)
     except Exception:
         pass
 
@@ -160,13 +179,19 @@ def probe_all(active, fh_data, fh_failed, cfg):
 
 # ------------------------------------------------------------ 生成一份报告
 
-def make_report(cfg, ch, cs, info, prev, today):
+def make_report(cfg, ch, cs, info, prev, today, status_cb=None):
     build = info["build"]
     notes_url, notes, kind = "", "", ""
+    # 官方说明的抓取必须有预算：极端网络下（超时 180s × 重试 × 10 个候选页）
+    # 以前能把整个哨兵卡住十几分钟，界面还会误以为它挂了。
+    notes_timeout = max(10, min(int(cfg.get("request_timeout") or 30), 40))
+    _status(status_cb, f"正在取官方发布说明：{ch['name']}")
     try:
         notes_url, notes, kind = source.official_notes(
             build, hints=[info["url"]] if info.get("url") else [],
-            major=(re.findall(r"\d{4,6}", build) or [""])[0])
+            major=(re.findall(r"\d{4,6}", build) or [""])[0],
+            timeout=notes_timeout,
+            deadline=time.monotonic() + max(90, notes_timeout * 2))
     except Exception as e:
         log(f"  [{ch['name']}] 取官方说明失败：{e}", "WARN")
 
@@ -180,10 +205,11 @@ def make_report(cfg, ch, cs, info, prev, today):
     try:
         key = resolve_api_key(cfg)
         if not key:
-            raise RuntimeError("还没填 API Key，打开设置界面「DeepSeek API」页填一个")
+            raise RuntimeError("还没填 AI 的 Key，打开设置界面「设置」页填一个")
         prompt = deepseek_api.build_prompt(
             ch["name"], build, prev, notes_url, kind, notes, today,
             detail=cfg.get("detail") or "标准")
+        _status(status_cb, f"正在让 AI 写报告：{ch['name']}")
         md = deepseek_api.summarize(cfg, key, prompt,
                                     timeout=int(cfg.get("request_timeout") or 180) + 60)
         if not md.lstrip().startswith("#"):
@@ -212,7 +238,37 @@ def make_report(cfg, ch, cs, info, prev, today):
 # ---------------------------------------------------------------- 主流程
 
 def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
-              cond=None, quiet=False, should_notify=None):
+              cond=None, quiet=False, should_notify=None,
+              wait_lock_seconds=0, status_cb=None):
+    """跑一轮完整检测（真正的逻辑在 _run_check_inner）。
+
+    wait_lock_seconds
+        抢不到「另一个检测正在进行」时最多等多久（秒）。
+        哨兵传 0（跳过这轮，半分钟后再试）；手动检测传 20（等后台那轮跑完）。
+    status_cb
+        可选回调 text -> None，用来把「当前在做什么」写进哨兵心跳。
+    """
+    lock = None
+    if not dry:
+        lock, acquired = hotwin.acquire_mutex(
+            CHECK_MUTEX, timeout_ms=max(0, int(wait_lock_seconds * 1000)))
+        if not acquired:
+            log(f"另一个检测正在进行，这次「{label}」先跳过"
+                f"（不会重复调 AI / 互相覆盖状态）", "WARN")
+            return {"updates": [], "errors": [], "checked": 0, "changed": False,
+                    "skip": "另一个检测正在进行"}
+    try:
+        return _run_check_inner(
+            cfg, state, only=only, dry=dry, do_notify=do_notify, label=label,
+            cond=cond, quiet=quiet, should_notify=should_notify,
+            status_cb=status_cb)
+    finally:
+        if lock:
+            hotwin.release_mutex(lock)
+
+
+def _run_check_inner(cfg, state, only=None, dry=False, do_notify=True, label="检测",
+                     cond=None, quiet=False, should_notify=None, status_cb=None):
     """跑一轮完整检测，返回结果字典。
 
     整个工具唯一「干活」的地方，两个调用者共用：
@@ -247,6 +303,7 @@ def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
     # ---- Flight Hub 只抓一次，多条 Insider 线共用 ----
     fh_data, fh_err, fh_unchanged = None, "", False
     if any(c["source"] == "flighthub" for c in active):
+        _status(status_cb, "正在检查官方看板")
         try:
             if cond is not None:
                 status, fh_data = source.flighthub_conditional(
@@ -273,11 +330,15 @@ def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
                 "changed": False, "skip": "没变化"}
 
     if fh_data and cfg.get("auto_discover_channels", True):
-        chans, added = ch_mod.merge_discovered(chans, fh_data)
+        _chans, added = ch_mod.merge_discovered(chans, fh_data)
         if added:
             log("发现新更新线（已加入列表，默认未启用）：" +
                 "，".join(c["name"] for c in added))
-            cfg["channels"] = chans
+            # ★ 只把「新增频道」并进配置，绝不整份回写。
+            #   整份回写用的是这一轮开始时的快照，AI 生成报告要几十秒到几分钟，
+            #   期间用户在界面改的任何设置都会被旧快照覆盖（以前真实踩过）。
+            cfg, _persisted = merge_channels(added)
+            chans = cfg["channels"]
 
     updates, errors = [], []
     # 先把所有线一次性探完（并发），再按原顺序逐条处理：写日志、调 AI 仍然串行，
@@ -325,7 +386,8 @@ def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
 
         try:
             md_path, summary, err, notes_url = make_report(cfg, ch, cs, info,
-                                                           prev, today)
+                                                           prev, today,
+                                                           status_cb=status_cb)
             log(f"  [{ch['name']}] 报告：{md_path}")
             cs["last_version"] = build
             cs["last_version_date"] = info.get("date", "")
@@ -362,7 +424,8 @@ def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
     # 先把「检测结果」落盘，再去发通知。顺序很重要：
     # 万一下面发通知那一步出问题，也不会因为状态没存上，导致下一轮又把同一个
     # 版本当成新的、再吵你一遍。
-    save_config(cfg)
+    # 注意：配置**不再整份回写**（自动发现的新频道已经在上面单独 merge 过），
+    # 否则这轮开始时的旧快照会覆盖用户刚改的设置。
     save_state(state)
 
     # ---- 通知 ----
@@ -388,6 +451,7 @@ def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
             mark_notified(state, [u["ch"]["id"] for u in fresh],
                           [u["build"] for u in fresh])
             save_state(state)
+            _status(status_cb, "正在发通知")
             sent = send_notifications(cfg, fresh)
             missed = [q for q in queued if q["build"] not in sent]
             if missed:
@@ -406,19 +470,28 @@ def run_check(cfg, state, only=None, dry=False, do_notify=True, label="检测",
     if do_notify and cfg.get("notify", True):
         flush_pending(cfg, state)
 
-    # 错误通知：连续取不到数据时才说一声（这个不算「重复通知」）
+    # 错误通知：连续取不到数据时才说一声。
+    # 以前每轮都按「总失败次数 >= 阈值」发一次，断网时每 5 分钟弹一条；
+    # 现在同一轮连续失败只提醒一次，成功检测后自动复位。
     threshold = int(cfg.get("notify_on_error_after") or 0)
     if errors and threshold > 0:
         total_fail = sum(int((state["channels"].get(c["id"]) or {}).get("fail_count") or 0)
                          for c in active)
         if total_fail >= threshold:
-            notify.register_app(cfg.get("app_id") or "WinUpdReport.App")
-            notify.show("win升级报告 · 检测出错了",
-                        f"连续 {threshold} 次以上取不到数据。{errors[-1][:120]}",
-                        app_id=cfg.get("app_id") or "WinUpdReport.App",
-                        button1="打开日志", button2="打开总览",
-                        arg1="log", arg2="index")
-            log("已发送错误通知", "WARN")
+            if not state.get("error_notified"):
+                notify.register_app(cfg.get("app_id") or "WinUpdReport.App")
+                notify.show("win升级报告 · 检测出错了",
+                            f"连续 {threshold} 次以上取不到数据。{errors[-1][:120]}",
+                            app_id=cfg.get("app_id") or "WinUpdReport.App",
+                            button1="打开日志", button2="打开总览",
+                            arg1="log", arg2="index")
+                state["error_notified"] = dt.datetime.now().isoformat(timespec="seconds")
+                log("已发送错误通知（这一轮连续失败只提醒一次）", "WARN")
+            else:
+                log("仍然取不到数据；之前已经提醒过，本轮不再重复弹通知")
+    elif not errors and state.get("error_notified"):
+        state["error_notified"] = ""
+        log("检测恢复正常，错误提醒状态已复位")
 
     save_state(state)          # 通知的记账（已提醒 / 待重试）也一起落盘
     log(f"完成：本次 {len(updates)} 条线有更新，{len(errors)} 个错误")
@@ -505,8 +578,12 @@ def main():
         log("--only 没匹配到任何更新线", "ERROR")
         return 2
 
-    run_check(cfg, state, only=only, dry=DRY, do_notify=not NO_NOTIFY,
-              label="手动检测")
+    res = run_check(cfg, state, only=only, dry=DRY, do_notify=not NO_NOTIFY,
+                    label="手动检测", wait_lock_seconds=20)
+    if isinstance(res, dict) and res.get("skip") == "另一个检测正在进行":
+        log("手动检测已跳过：后台正在跑另一轮检测，等它结束再试（或看它的结果）。",
+            "WARN")
+        return 3
     return 0
 
 

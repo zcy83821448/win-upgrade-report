@@ -1,6 +1,11 @@
 # 运行时数据（首次运行会自动生成，含本机绝对路径，不入库）
 config.json
 state.json
+config.json.bak
+state.json.bak
+config.json.corrupt-*
+state.json.corrupt-*
+*.tmp
 
 # 抓取/生成的内容
 logs/
@@ -12,6 +17,7 @@ personalize/
 # 构建产物
 __pycache__/
 *.pyc
+.pytest_cache/
 build/
 dist/
 *.spec
@@ -24,3 +30,8 @@ dist/
 # 编辑器
 .vscode/
 .idea/
+
+# WPF 设置界面的编译产物
+ui/WinUpdReport.UI/bin/
+ui/WinUpdReport.UI/obj/
+

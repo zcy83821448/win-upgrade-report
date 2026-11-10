@@ -264,21 +264,55 @@ def page_text(page_html):
     return "\n".join(lines).strip()
 
 
-def _try_learn_search(build, major):
-    """用 Learn 站内搜索按构建号找官方说明；major 用于排除搜错的页面。"""
+def _remaining(deadline):
+    """距离本次抓取总预算还剩几秒；None = 不设总预算。"""
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def _req_timeout(timeout, deadline):
+    """单次请求超时：既要遵守单项上限，也要服从本次抓取的总预算。
+
+    返回 None 表示预算已经用完，调用方应该立刻放弃（而不是再发一个长请求）。
+    """
+    left = _remaining(deadline)
+    if left is None:
+        return timeout or 30
+    if left <= 1:
+        return None
+    return max(5, min(timeout or 30, left))
+
+
+def _try_learn_search(build, major, timeout=None, deadline=None, max_pages=3):
+    """用 Learn 站内搜索按构建号找官方说明；major 用于排除搜错的页面。
+
+    最多看 max_pages 个结果页，并且每次请求都守 deadline：极端网络下
+    宁可带着「没取到官方原文」出兜底报告，也不能把哨兵卡死十几分钟。
+    """
+    t = _req_timeout(timeout, deadline)
+    if t is None:
+        return None, ""
     try:
-        data = json.loads(http_get(_LEARN_SEARCH + urllib.parse.quote(build)))
+        data = json.loads(http_get(_LEARN_SEARCH + urllib.parse.quote(build), timeout=t))
     except Exception:
         return None, ""
     want_slug = str(build).replace(".", "-")
+    checked = 0
     for item in data.get("results", []):
         u = item.get("url", "")
         if "release-notes" not in u and "release-health" not in u:
             continue
         if "release-notes" in u and major and want_slug not in u and major not in u:
             continue          # 别把别的版本的说明当成本版本的
+        if checked >= max_pages:
+            break
+        checked += 1
+        t = _req_timeout(timeout, deadline)
+        if t is None:
+            break
         try:
-            txt = page_text(http_get(u))
+            txt = page_text(http_get(u, timeout=t))
         except Exception:
             continue
         if len(txt) > 200:
@@ -286,9 +320,13 @@ def _try_learn_search(build, major):
     return None, ""
 
 
-def _try_ddg(build, major):
+def _try_ddg(build, major, timeout=None, deadline=None, max_pages=3):
+    t = _req_timeout(timeout, deadline)
+    if t is None:
+        return None, ""
     try:
-        h = http_get(_DDG + urllib.parse.quote(f"Windows 11 build {build} release notes"))
+        h = http_get(_DDG + urllib.parse.quote(f"Windows 11 build {build} release notes"),
+                     timeout=t)
     except Exception:
         return None, ""
     urls = []
@@ -302,11 +340,14 @@ def _try_ddg(build, major):
     urls = [u for u in urls if "duckduckgo" not in u]
     # 官方站点优先
     urls.sort(key=lambda u: (0 if "microsoft.com" in u else 1))
-    for u in urls:
+    for u in urls[:max_pages]:
         if major and major not in u:
             continue
+        t = _req_timeout(timeout, deadline)
+        if t is None:
+            break
         try:
-            txt = page_text(http_get(u))
+            txt = page_text(http_get(u, timeout=t))
         except Exception:
             continue
         if len(txt) > 200:
@@ -314,23 +355,29 @@ def _try_ddg(build, major):
     return None, ""
 
 
-def official_notes(build, hints=None, major=None):
+def official_notes(build, hints=None, major=None, timeout=None, deadline=None):
     """按可靠性依次尝试，返回 (url, 原文, 来源种类)。
 
     hints: 已知的候选链接列表（Flight Hub 上的官方说明链接优先用它）
+    timeout / deadline: 单次请求超时 + 本次三级回退的总预算（秒级）。设置
+        总预算的原因：以前每级回退都用 request_timeout（用户可能配 180s），
+        再乘重试和候选页数量，一个坏网络就能让哨兵看起来「死了」十几分钟。
     """
     major = major or (re.findall(r"\d{4,6}", str(build)) or [""])[0]
     for url in (hints or []):
+        t = _req_timeout(timeout, deadline)
+        if t is None:
+            break
         try:
-            txt = page_text(http_get(url))
+            txt = page_text(http_get(url, timeout=t))
             if len(txt) > 200:
                 return url, txt, "官方（链接已知）"
         except Exception:
             continue
-    u, t = _try_learn_search(build, major)
+    u, t = _try_learn_search(build, major, timeout=timeout, deadline=deadline)
     if t:
         return u, t, "微软 Learn 搜索"
-    u, t = _try_ddg(build, major)
+    u, t = _try_ddg(build, major, timeout=timeout, deadline=deadline)
     if t:
         return u, t, "搜索到的官方页面"
     return None, "", ""

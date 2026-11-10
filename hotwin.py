@@ -21,9 +21,12 @@ GUI_MUTEX = r"Local\WinUpdReportGui"
 GUI_SHOW_EVENT = r"Local\WinUpdReportGuiShow"
 GUI_QUIT_EVENT = r"Local\WinUpdReportGuiQuit"
 WATCH_MUTEX = r"Local\WinUpdReportWatch"
+# 检测互斥：哨兵和「手动单线检测」子进程共用，避免两边同时调 AI / 写状态
+CHECK_MUTEX = r"Local\WinUpdReportCheckLock"
 
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
+WAIT_ABANDONED = 0x80
 SYNCHRONIZE = 0x00100000
 EVENT_MODIFY_STATE = 0x0002
 ERROR_ALREADY_EXISTS = 183
@@ -73,6 +76,36 @@ def mutex_exists(name):
         return True
     except Exception:
         return False
+
+
+def acquire_mutex(name, timeout_ms=0):
+    """试着占住一个命名互斥体，返回 (句柄, 是否占到)。
+
+    拿不到句柄（非 Windows / 极度受限）时返回 (None, True)：不能因为这个
+    让功能直接不工作，调用方照常跑，只是少一层跨进程保护。
+    进程崩溃时互斥体由系统释放，下一次会返回 WAIT_ABANDONED，视为已占到。
+    """
+    handle, _already = create_mutex(name)
+    if not handle:
+        return None, True
+    try:
+        r = _k32.WaitForSingleObject(ctypes.c_void_p(handle), int(timeout_ms))
+    except Exception:
+        close_handle(handle)
+        return None, True
+    if r in (WAIT_OBJECT_0, WAIT_ABANDONED):
+        return handle, True
+    close_handle(handle)
+    return None, False
+
+
+def release_mutex(handle):
+    try:
+        if handle:
+            _k32.ReleaseMutex(ctypes.c_void_p(handle))
+    except Exception:
+        pass
+    close_handle(handle)
 
 
 def create_event(name):

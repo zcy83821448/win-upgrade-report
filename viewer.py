@@ -42,11 +42,70 @@ def _log_error(where):
         pass
 
 
-def _embed_css(html):
-    """沿用设置界面阅读器的内嵌样式（字号、行宽、配色）。"""
+def _msg(title, text):
+    """没有控制台时的最后一道出口：原生中文消息框，绝不把英文 traceback 甩给用户。"""
     try:
-        from gui import _inject_report_css
-        return _inject_report_css(html)
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, str(text), str(title), 0x40)
+        return True
+    except Exception:
+        return False
+
+
+def _webui_file(name):
+    """读 webui/ 下的共享前端文件（chrome.css / chrome.js 等）。"""
+    try:
+        p = resource_path(os.path.join("webui", name))
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        _log_error(f"读取 webui/{name}")
+        return ""
+
+
+def _open_path(path, fallback=""):
+    """打开文件/文件夹；失败时给中文提示而不是抛异常。"""
+    try:
+        target = path if os.path.exists(path) else fallback
+        if not target or not os.path.exists(target):
+            _msg("打不开", f"这个位置还不存在：\n{path or fallback}")
+            return False
+        os.startfile(target)                                   # noqa: S606
+        return True
+    except Exception:
+        _log_error("打开路径")
+        _msg("打不开", f"系统没能打开这个位置：\n{path}\n可以手动在资源管理器里打开它。")
+        return False
+
+
+def _ensure_report_dir(cfg):
+    base = cfg.get("report_dir") or REPORT_DIR
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+
+def _embed_css(html):
+    """沿用设置界面阅读器的内嵌样式（字号、行宽、配色）。
+
+    样式唯一来源是 webui/reader.css；老报告里已经内联过就跳过，不重复加。
+    """
+    try:
+        if 'id="winupd-reader"' in html:
+            return html
+        tag = reporter.reader_style_tag()
+        if not tag:
+            return html
+        low = html.lower()
+        if "</style>" in low:
+            i = low.rfind("</style>")
+            return html[:i] + tag + html[i:]
+        if "</head>" in low:
+            i = low.rfind("</head>")
+            return html[:i] + tag + html[i:]
+        return tag + html
     except Exception:
         _log_error("注入报告样式")
         return html
@@ -74,7 +133,8 @@ def _report_title(html_path, cfg=None):
 
 
 # 自绘窗口边框 + 标题栏 + 八向缩放 + 报告 iframe 的整页外壳。
-# 样式刻意复制设置窗口的 titlebar / wbtn / resizers，作为同一个产品的外观。
+# 标题栏 / 窗口按钮 / 缩放抓手的样式与逻辑来自 webui/chrome.css 与 chrome.js
+# （和设置窗口共用同一份，避免两套复制件以后各改各的）。
 _SHELL = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -83,10 +143,17 @@ _SHELL = """<!doctype html>
 <title>@@TITLE@@</title>
 <style>
 :root{
-  --bg:#F6F5F2; --surface:#FFFFFF; --line:#E7E3DC;
+  --bg:#F6F5F2; --surface:#FFFFFF; --surface-2:#FBFAF7;
+  --paper-line:#E7E3DC; --paper-line-strong:#D8D3CA;
   --ink:#1C1B19; --ink-2:#5F5B54; --ink-3:#6F6A61;
-  --accent:#1F5AE0; --font:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  --accent:#1F5AE0; --accent-soft:#EDF2FD;
+  --radius:10px; --radius-sm:7px; --radius-lg:14px;
+  --shadow:0 1px 2px rgba(28,27,25,.04);
+  --ease:cubic-bezier(.2,.7,.3,1); --ease-out:cubic-bezier(.22,.61,.36,1);
+  --ease-spring:cubic-bezier(.34,1.42,.64,1); --t:160ms;
+  --font:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
 }
+@@CHROME_CSS@@
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%}
 body{
@@ -94,62 +161,16 @@ body{
   font-size:13.5px;overflow:hidden;user-select:none;cursor:default;
 }
 .app{display:flex;flex-direction:column;height:100%}
-.titlebar{
-  position:relative;flex:0 0 40px;height:40px;
-  display:flex;align-items:stretch;justify-content:space-between;
-  background:var(--bg);border-bottom:1px solid var(--line);user-select:none;
-}
-.titlebar-drag{
-  flex:1;min-width:0;display:flex;align-items:center;gap:9px;
-  padding:0 10px 0 15px;cursor:default;
-}
-.tb-mark{
-  width:16px;height:16px;flex:none;display:block;
-  fill:none;stroke:currentColor;stroke-width:1.35;
-  stroke-linecap:round;stroke-linejoin:round;color:var(--ink);
-}
-.tb-name{font-size:12px;color:var(--ink-2);white-space:nowrap;flex:none}
-.tb-div{width:1px;height:12px;background:var(--line);flex:none;margin:0 2px}
 .tb-title{
   font-size:12.5px;font-weight:600;color:var(--ink);
   min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.wctl{display:flex;height:100%;flex:none}
-.wbtn{
-  width:46px;height:100%;padding:0;border:0;border-radius:0;
-  background:transparent;color:var(--ink-2);
-  display:flex;align-items:center;justify-content:center;cursor:default;
-}
-.wbtn:hover{background:#ECE9E3;color:var(--ink)}
-.wbtn:active{background:#E2DED7}
-.wbtn-close:hover{background:#C42B1C;color:#fff}
-.wbtn-close:active{background:#AC2417;color:#fff}
-.wbtn:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
-.wbtn .ico{
-  width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.2;
-  stroke-linecap:round;stroke-linejoin:round;
-}
 .content{position:relative;flex:1;min-height:0;background:var(--bg);padding:14px 16px 16px}
 .doc-card{
-  height:100%;background:#fff;border:1px solid var(--line);border-radius:12px;
-  box-shadow:0 1px 2px rgba(28,27,25,.04);overflow:hidden;
+  height:100%;background:#fff;border:1px solid var(--paper-line);border-radius:12px;
+  box-shadow:var(--shadow);overflow:hidden;
 }
 .doc{display:block;width:100%;height:100%;border:0;background:#fff}
-.resizers{position:fixed;inset:0;z-index:40;pointer-events:none}
-.rz{position:fixed;pointer-events:auto;background:transparent}
-.rz-n{top:0;left:10px;right:10px;height:5px;cursor:ns-resize}
-.rz-s{bottom:0;left:10px;right:10px;height:5px;cursor:ns-resize}
-.rz-w{left:0;top:10px;bottom:10px;width:5px;cursor:ew-resize}
-.rz-e{right:0;top:10px;bottom:10px;width:5px;cursor:ew-resize}
-.rz-nw{top:0;left:0;width:10px;height:10px;cursor:nwse-resize}
-.rz-ne{top:0;right:0;width:10px;height:10px;cursor:nesw-resize}
-.rz-sw{bottom:0;left:0;width:10px;height:10px;cursor:nesw-resize}
-.rz-se{bottom:0;right:0;width:10px;height:10px;cursor:nwse-resize}
-body.is-maximized .resizers{display:none}
-.titlebar.is-blurred .tb-name,
-.titlebar.is-blurred .tb-title,
-.titlebar.is-blurred .wbtn{color:var(--ink-3)}
-.titlebar.is-blurred .wbtn:hover{color:var(--ink)}
 </style>
 </head>
 <body>
@@ -185,7 +206,7 @@ body.is-maximized .resizers{display:none}
   </header>
   <div class="content">
     <div class="doc-card">
-      <iframe class="doc" title="报告内容" sandbox="allow-same-origin allow-popups"
+      <iframe class="doc" title="报告内容" sandbox="allow-same-origin"
         srcdoc="@@DOC@@"></iframe>
     </div>
   </div>
@@ -203,52 +224,13 @@ body.is-maximized .resizers{display:none}
 </div>
 
 <script>
+@@CHROME_JS@@
+</script>
+<script>
 (function(){
-  function api(){ return (window.pywebview && window.pywebview.api) || null; }
-  function call(name, arg){
-    var a = api();
-    if (!a || typeof a[name] !== 'function') return null;
-    try {
-      /* 无参方法必须真的不传参：pywebview 把 undefined 当成一个参数，
-         Python 侧 window_toggle_max() 会因此 TypeError，按钮就"失灵"了。 */
-      return arg === undefined ? a[name]() : a[name](arg);
-    } catch (e) { return null; }
-  }
-  function setMax(max){
-    document.body.classList.toggle('is-maximized', !!max);
-    var use = document.querySelector('#winMax use');
-    if (use) use.setAttribute('href', max ? '#i-win-restore' : '#i-win-max');
-    var btn = document.getElementById('winMax');
-    if (btn) {
-      btn.title = max ? '还原' : '最大化';
-      btn.setAttribute('aria-label', btn.title);
-    }
-  }
-  function toggleMax(){
-    var r = call('window_toggle_max');
-    if (r && r.then) r.then(function(x){ if (x && typeof x.maximized === 'boolean') setMax(x.maximized); });
-  }
-  document.getElementById('winMin').addEventListener('click', function(){ call('window_minimize'); });
-  document.getElementById('winMax').addEventListener('click', toggleMax);
-  document.getElementById('winClose').addEventListener('click', function(){ call('window_close'); });
-  document.getElementById('titlebarDrag').addEventListener('dblclick', function(e){
-    e.preventDefault(); toggleMax();
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.wbtn'), function(btn){
-    btn.addEventListener('mousedown', function(e){ e.stopPropagation(); });
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.rz'), function(rz){
-    rz.addEventListener('mousedown', function(e){
-      e.preventDefault(); e.stopPropagation();
-      if (document.body.classList.contains('is-maximized')) return;
-      call('begin_resize', rz.dataset.edge);
-    });
-  });
-  var bar = document.getElementById('titlebar');
-  function syncFocus(){ if (bar) bar.classList.toggle('is-blurred', !document.hasFocus()); }
-  window.addEventListener('focus', syncFocus);
-  window.addEventListener('blur', syncFocus);
-  syncFocus();
+  function boot(){ if (window.WinUpdChrome) window.WinUpdChrome.init({}); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })();
 </script>
 </body>
@@ -257,7 +239,11 @@ body.is-maximized .resizers{display:none}
 
 
 def _shell_html(title, doc):
-    return (_SHELL.replace("@@TITLE@@", html_mod.escape(title))
+    chrome_css = _webui_file("chrome.css")
+    chrome_js = _webui_file("chrome.js")
+    return (_SHELL.replace("@@CHROME_CSS@@", chrome_css)
+                  .replace("@@CHROME_JS@@", chrome_js)
+                  .replace("@@TITLE@@", html_mod.escape(title))
                   .replace("@@DOC@@", html_mod.escape(doc, quote=True)))
 
 
@@ -342,8 +328,9 @@ def render_report(md_path):
     title = os.path.splitext(os.path.basename(md_path))[0]
     html_path = os.path.splitext(md_path)[0] + ".html"
     try:
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(render_page(md, title))
+        from config import atomic_write_text
+        atomic_write_text(html_path, render_page(md, title,
+                                                 extra_css=reporter.reader_style_tag()))
     except Exception:
         _log_error("渲染 Markdown 报告")
         return md_path
@@ -384,7 +371,7 @@ def _open_target(target, cfg):
 def main():
     arg = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
     cfg = load_config()
-    report_dir = cfg.get("report_dir") or REPORT_DIR
+    report_dir = _ensure_report_dir(cfg)
     low = arg.lower()
 
     if low.startswith("winupdrept:"):
@@ -395,21 +382,29 @@ def main():
         webbrowser.open(arg)
         return 0
     if low in ("folder", "--folder"):
-        os.startfile(report_dir)                    # noqa: S606
-        return 0
+        return 0 if _open_path(report_dir) else 1
     if low in ("log", "--log"):
-        log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "checker.log")
-        os.startfile(log if os.path.exists(log) else os.path.dirname(log))  # noqa: S606
-        return 0
+        # ★ 不能用 __file__ 推路径：绿色版里 __file__ 在 _internal\ 下，
+        #   以前点「打开日志」会直接 FileNotFoundError（真实踩到的崩溃）。
+        log = os.path.join(LOG_DIR, "checker.log")
+        return 0 if _open_path(log, LOG_DIR) else 1
     if low in ("index", "--index"):
         idx = os.path.join(report_dir, reporter.INDEX_NAME)
         if not os.path.exists(idx):
-            from config import load_state
-            st = load_state()
-            names = {c["id"]: c.get("name", c["id"]) for c in cfg.get("channels", [])}
-            reporter.write_index(cfg, st, names)
-        webbrowser.open("file:///" + idx.replace("\\", "/"))
-        return 0
+            try:
+                from config import load_state
+                st = load_state()
+                names = {c["id"]: c.get("name", c["id"]) for c in cfg.get("channels", [])}
+                reporter.write_index(cfg, st, names)
+            except Exception:
+                _log_error("生成总览页")
+        try:
+            webbrowser.open("file:///" + idx.replace("\\", "/"))
+            return 0
+        except Exception:
+            _log_error("浏览器打开总览页")
+            _msg("打不开总览页", f"可以手动打开这个文件：\n{idx}")
+            return 1
 
     if low.startswith("r/"):
         target = find_by_arg(cfg, arg)
@@ -421,7 +416,9 @@ def main():
 
     target = newest_report(report_dir)
     if not target:
-        os.startfile(report_dir)                    # noqa: S606
+        _open_path(report_dir)
+        _msg("还没有报告", "检测到新版本后，这里会生成中文更新报告。\n"
+                          f"报告目录：\n{report_dir}")
         return 1
     return 0 if _open_target(target, cfg) else 1
 
