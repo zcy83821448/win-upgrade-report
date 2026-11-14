@@ -160,8 +160,8 @@ namespace WinUpd
             var sp = new StackPanel();
             _blur = AddSlider(sp, "模糊强度", "卡片背后那层图糊到什么程度，越大越像毛玻璃",
                 Json.Int(p, "blur", 15), 0, 60, "px", out _blurVal, "personalize_blur");
-            _card = AddSlider(sp, "卡片白纱", "卡片白色的浓度；太低文字会看不清",
-                Json.Int(p, "card_alpha", 70), 40, 98, "%", out _cardVal, "personalize_card_alpha");
+            _card = AddSlider(sp, "卡片白纱", "卡片白色的浓度；0% 时完全透明，只剩描边和文字",
+                Json.Int(p, "card_alpha", 70), 0, 98, "%", out _cardVal, "personalize_card_alpha");
             _scrim = AddSlider(sp, "图片蒙层", "整张图上的蒙层；图片偏深、偏花时调高更好读",
                 Json.Int(p, "scrim_alpha", 0), 0, 70, "%", out _scrimVal, "personalize_scrim_alpha");
             return Ui.Card(sp);

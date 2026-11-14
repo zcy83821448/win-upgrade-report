@@ -8,7 +8,7 @@ namespace WinUpd
 {
     /// <summary>
     /// 三次贝塞尔缓动，参数和 CSS cubic-bezier 完全一致。
-    /// 这样界面里的动效可以按"设计稿语言"描述：标准 (0.2,0,0,1)、减速 (0.05,0.7,0.1,1)……
+    /// 这样界面里的动效可以按"设计稿语言"描述：标准 (0.05,0.7,0.1,1) 快-慢、退场 (0.1,0.8,0.2,1)……
     /// </summary>
     public sealed class BezierEase : EasingFunctionBase
     {
@@ -17,6 +17,10 @@ namespace WinUpd
         public BezierEase(double x1, double y1, double x2, double y2)
         {
             _x1 = x1; _y1 = y1; _x2 = x2; _y2 = y2;
+            // WPF 的 EasingFunctionBase 默认是 EaseOut，而 EaseOut 会把 EaseInCore 的时间轴
+            // 反过来用（Ease(t)=1-EaseInCore(1-t)），等于把 CSS cubic-bezier 镜像了。
+            // 这里强制 EaseIn，Ease(t) 才真正等于我们写的 cubic-bezier(x1,y1,x2,y2)。
+            EasingMode = EasingMode.EaseIn;
         }
 
         protected override Freezable CreateInstanceCore()
@@ -70,9 +74,11 @@ namespace WinUpd
         public const int Slow = 300;
         public const int Enter = 340;
 
-        public static IEasingFunction Standard { get { return new BezierEase(0.2, 0, 0, 1); } }
+        // 统一用「快-慢」（ease-out）：点击/切换的第一帧就动起来，尾部再慢慢收住。
+        // 不用「慢-快-慢」——那种曲线前段几乎不动，会让人觉得界面在延迟响应。
+        public static IEasingFunction Standard { get { return new BezierEase(0.05, 0.7, 0.1, 1); } }
         public static IEasingFunction Decelerate { get { return new BezierEase(0.05, 0.7, 0.1, 1); } }
-        public static IEasingFunction Accelerate { get { return new BezierEase(0.3, 0, 0.8, 0.16); } }
+        public static IEasingFunction Accelerate { get { return new BezierEase(0.1, 0.8, 0.2, 1); } }
         public static IEasingFunction Soft { get { return new CubicEase { EasingMode = EasingMode.EaseOut }; } }
 
         /// <summary>带回弹的缓动，只给"物体"用（开关拇指、指示条），不给文字用。</summary>

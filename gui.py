@@ -1076,7 +1076,7 @@ class GuiApi:
         cfg["personalize_blur"] = max(
             0, min(80, _as_int(cfg.get("personalize_blur"), 15)))
         cfg["personalize_card_alpha"] = max(
-            40, min(98, _as_int(cfg.get("personalize_card_alpha"), 70)))
+            0, min(98, _as_int(cfg.get("personalize_card_alpha"), 70)))
         cfg["personalize_scrim_alpha"] = max(
             0, min(70, _as_int(cfg.get("personalize_scrim_alpha"), 0)))
         acc = str(cfg.get("personalize_accent") or "").strip()

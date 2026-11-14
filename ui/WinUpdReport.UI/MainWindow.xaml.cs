@@ -25,11 +25,17 @@ namespace WinUpd
         private AppData _data = new AppData();
         private PollUpdate _lastPoll = new PollUpdate();
         private string _currentPage = "overview";
+        private FrameworkElement _pageRoot;
+        private DispatcherTimer _pageOutTimer;
         private string _readerFile = "";
         private bool _polling;
         private bool _bootstrapRunning;
         private bool _shotDone;
         private bool _quitting;
+        private bool _startupFaded;
+        private DispatcherTimer _startupFallback;
+        private bool _closingFadeStarted;
+        private bool _forceClose;
         private readonly RotateTransform _spinner = new RotateTransform();
         private readonly DispatcherTimer _blurTimer;
         private BlurBase _blurBase;
@@ -128,6 +134,8 @@ namespace WinUpd
             if (AppEnv.Maximized) WindowState = WindowState.Maximized;
             App.Boot("MW: InitializeComponent done");
             AppEnv.Mark("MainWindow InitializeComponent done");
+            // 截图调试时窗口必须正常可见
+            if (!string.IsNullOrEmpty(AppEnv.ShotPath)) Opacity = 1;
 
             // 首屏直接用磁盘快照，不等 Python 服务。
             try
@@ -163,6 +171,7 @@ namespace WinUpd
             SizeChanged += (s, e) =>
             {
                 UpdateMaxGlyph();
+                UpdateWindowCorners();
                 MoveNavIndicator(false);
                 OnWindowLayoutMoved();
             };
@@ -171,7 +180,7 @@ namespace WinUpd
             // 毛玻璃只在卡片底下有，所以必须跟着卡片重画。
             AddHandler(ScrollViewer.ScrollChangedEvent,
                 new ScrollChangedEventHandler(OnAnyScrollChanged), true);
-            StateChanged += (s, e) => { UpdateMaxGlyph(); };
+            StateChanged += (s, e) => { UpdateMaxGlyph(); UpdateWindowCorners(); };
             PreviewKeyDown += OnPreviewKeyDown;
             // 滚轮平滑滚动（整页 / 列表 / 日志 / 阅读器都生效）
             SmoothScroll.Attach(Root);
@@ -199,9 +208,25 @@ namespace WinUpd
             {
                 App.Boot("Loaded: before Dwm");
                 Dwm.RoundCorners(this);
+                Dwm.NoBorder(this);
                 App.Boot("Loaded: after Dwm");
-                Anim.WindowIn(Root);
-                App.Boot("Loaded: after WindowIn");
+                Dispatcher.BeginInvoke(new Action(UpdateWindowCorners),
+                    System.Windows.Threading.DispatcherPriority.Loaded);
+                // 首帧先保持不可见：等 bootstrap 把壁纸/毛玻璃准备好，再整体淡入，
+                // 避免用户先看到素色界面、壁纸随后"啪"地出现。
+                int wait = AppEnv.NoService ? 700 : 1900;
+                _startupFallback = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(wait)
+                };
+                _startupFallback.Tick += (s2, e2) =>
+                {
+                    _startupFallback.Stop();
+                    _startupFallback = null;
+                    TryStartupFade();
+                };
+                _startupFallback.Start();
+                App.Boot("Loaded: startup fade gate armed");
                 Dispatcher.BeginInvoke(new Action(() => MoveNavIndicator(false)),
                     System.Windows.Threading.DispatcherPriority.Loaded);
             }
@@ -219,6 +244,7 @@ namespace WinUpd
             HwndSource source = HwndSource.FromHwnd(helper.Handle);
             if (source != null) source.AddHook(WndProc);
             Dwm.RoundCorners(this);
+            Dwm.NoBorder(this);
         }
 
         private void AttachClient()
@@ -314,6 +340,37 @@ namespace WinUpd
             }
             ScheduleFrostCollect();
             MaybeFinishShot();
+            // 数据（含壁纸）已经应用，可以让窗口淡入了
+            TryStartupFade();
+        }
+
+        /// <summary>
+        /// 启动淡入：bootstrap + 个性化应用之后调用；如果后台一直没回应，
+        /// OnLoaded 里的兜底定时器也会调用，保证窗口不会永远不可见。
+        /// </summary>
+        private void TryStartupFade()
+        {
+            if (_startupFaded) return;
+            _startupFaded = true;
+            if (_startupFallback != null)
+            {
+                _startupFallback.Stop();
+                _startupFallback = null;
+            }
+            // 等一帧让壁纸/模糊底图真正画进视觉树，再开始整窗淡入
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!string.IsNullOrEmpty(AppEnv.ShotPath))
+                {
+                    // 截图调试：不要被淡入动画影响，直接给最终状态
+                    Opacity = 1;
+                    StartFrostFollow(340);
+                    return;
+                }
+                // 官方做法：AllowsTransparency=True + Window.Opacity 动画，才是从桌面透明显现
+                Anim.Animate(this, UIElement.OpacityProperty, 0, 1, 380, Anim.Soft);
+                StartFrostFollow(340);
+            }), System.Windows.Threading.DispatcherPriority.Render);
         }
 
         // ================================================================ 轮询
@@ -695,7 +752,8 @@ namespace WinUpd
             if (string.IsNullOrEmpty(key)) key = "overview";
             int newIndex = NavIndex(key);
             int oldIndex = NavIndex(_currentPage);
-            bool same = key == _currentPage && PageHost.Children.Count > 0;
+            bool same = key == _currentPage && _pageRoot != null
+                && PageHost.Children.Contains(_pageRoot);
 
             IPage page;
             if (!_pages.TryGetValue(key, out page))
@@ -706,27 +764,36 @@ namespace WinUpd
             }
 
             var root = page.Root as FrameworkElement;
-            var old = PageHost.Children.Count > 0 ? PageHost.Children[0] as FrameworkElement : null;
 
             if (!same && root != null)
             {
                 _currentPage = key;
-                // 快速连点时先把上一次还没退完的页面清掉，避免页面堆叠
-                while (PageHost.Children.Count > 1)
-                    PageHost.Children.RemoveAt(1);
-                // 再快速点回正在淡出的旧页：先把它的父级清掉再重新加入，否则 WPF 会报
-                // "Visual 已经是另一个 Visual 的子级" 直接崩掉
+                // 上一次翻页的「延迟移除旧页」还没执行就再次翻页：先取消它，
+                // 否则它会把这次刚切回来的页面当成旧页删掉，造成整页空白。
+                if (_pageOutTimer != null)
+                {
+                    _pageOutTimer.Stop();
+                    _pageOutTimer = null;
+                }
+
+                FrameworkElement old = _pageRoot;
+                // 清理除「正在淡出的旧页」和「要入场的页」之外的残留页面
+                for (int i = PageHost.Children.Count - 1; i >= 0; i--)
+                {
+                    var child = PageHost.Children[i];
+                    if (ReferenceEquals(child, root) || ReferenceEquals(child, old)) continue;
+                    PageHost.Children.RemoveAt(i);
+                }
+                // 快速点回正在淡出的页面：先解绑再重新加到最上层
                 if (PageHost.Children.Contains(root)) PageHost.Children.Remove(root);
                 if (ReferenceEquals(old, root)) old = null;
+                _pageRoot = root;
                 PageHost.Children.Add(root);
-            }
 
-            try { page.LoadData(_data); } catch (Exception e) { AppEnv.Log("页面加载失败 " + key + "：" + e); }
-            try { page.ApplyPoll(_lastPoll); } catch { }
+                try { page.LoadData(_data); } catch (Exception e) { AppEnv.Log("页面加载失败 " + key + "：" + e); }
+                try { page.ApplyPoll(_lastPoll); } catch { }
 
-            if (!same && root != null)
-            {
-                if (old == null)
+                if (old == null || !PageHost.Children.Contains(old))
                 {
                     Anim.PageIn(root, 0);
                 }
@@ -735,15 +802,25 @@ namespace WinUpd
                     int direction = newIndex >= oldIndex ? 1 : -1;
                     Anim.PageIn(root, direction);
                     Anim.PageOut(old, direction);
+                    var outPage = old;
                     var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(230) };
                     timer.Tick += (s, e) =>
                     {
                         timer.Stop();
-                        if (PageHost.Children.Contains(old)) PageHost.Children.Remove(old);
+                        if (ReferenceEquals(_pageOutTimer, timer)) _pageOutTimer = null;
+                        // 只有它仍然不是当前页时才移除（防止快速切回时误删新页）
+                        if (!ReferenceEquals(outPage, _pageRoot) && PageHost.Children.Contains(outPage))
+                            PageHost.Children.Remove(outPage);
                         ScheduleFrostCollect();
                     };
+                    _pageOutTimer = timer;
                     timer.Start();
                 }
+            }
+            else if (root != null)
+            {
+                try { page.LoadData(_data); } catch (Exception e) { AppEnv.Log("页面加载失败 " + key + "：" + e); }
+                try { page.ApplyPoll(_lastPoll); } catch { }
             }
 
             foreach (var rb in Ui.FindAll<RadioButton>(NavList))
@@ -834,6 +911,20 @@ namespace WinUpd
         {
             WindowState = WindowState == WindowState.Maximized
                 ? WindowState.Normal : WindowState.Maximized;
+        }
+
+        /// <summary>透明窗口没有 DWM 圆角，用一层圆角 Clip 自己把四个角裁出来。</summary>
+        private void UpdateWindowCorners()
+        {
+            if (Root == null) return;
+            double r = WindowState == WindowState.Maximized ? 0 : 14;
+            double w = Root.ActualWidth, h = Root.ActualHeight;
+            if (w <= 0 || h <= 0)
+            {
+                Root.Clip = null;
+                return;
+            }
+            Root.Clip = new RectangleGeometry(new Rect(0, 0, w, h), r, r);
         }
 
         private void UpdateMaxGlyph()
@@ -965,6 +1056,9 @@ namespace WinUpd
             catch { }
             if (_personalized && sig == _personalizeSig) return;
             _personalizeSig = sig;
+            // 如果窗口已经淡入完了才拿到壁纸（后台慢/超时兜底），让壁纸和毛玻璃淡进来，
+            // 而不是硬切出现。
+            bool lateWallpaper = _startupFaded && _wallpaperSharp == null;
             BitmapSource bmp = null;
             try
             {
@@ -998,6 +1092,18 @@ namespace WinUpd
             Frost.SetCorner(14);
             RebuildBlur(true);
             ScheduleFrostCollect();
+            if (lateWallpaper)
+            {
+                Wallpaper.Opacity = 0;
+                Frost.Opacity = 0;
+                Anim.Animate(Wallpaper, OpacityProperty, 0, 1, 320, Anim.Standard);
+                Anim.Animate(Frost, OpacityProperty, 0, 1, 320, Anim.Standard);
+            }
+            else
+            {
+                Wallpaper.Opacity = 1;
+                Frost.Opacity = 1;
+            }
         }
 
         private void ResetTheme()
@@ -1005,6 +1111,8 @@ namespace WinUpd
             _personalized = false;
             Wallpaper.Visibility = Visibility.Collapsed;
             Wallpaper.Source = null;
+            Wallpaper.Opacity = 1;
+            if (Frost != null) Frost.Opacity = 1;
             Scrim.Visibility = Visibility.Collapsed;
             if (Frost != null)
             {
@@ -1078,7 +1186,8 @@ namespace WinUpd
             {
                 SetBrush("BgBrush", Color.FromRgb(0xF7, 0xF5, 0xF1));
                 SetBrush("SurfaceBrush", Color.FromArgb(a, 255, 255, 255));
-                SetBrush("Surface2Brush", Color.FromArgb((byte)Math.Min(255, a + 14), 251, 250, 247));
+                SetBrush("Surface2Brush", Color.FromArgb(
+                    (byte)(a == 0 ? 0 : Math.Min(255, a + 14)), 251, 250, 247));
                 SetBrush("LineBrush", Color.FromRgb(0xE8, 0xE4, 0xDC));
                 SetBrush("LineStrongBrush", Color.FromRgb(0xD9, 0xD3, 0xC9));
                 SetBrush("InkBrush", Color.FromRgb(0x1B, 0x1A, 0x18));
@@ -1098,7 +1207,7 @@ namespace WinUpd
                 SetBrush("PrimaryHoverBrush", Color.FromRgb(0x35, 0x32, 0x2D));
                 SetBrush("NavActiveBrush", Colors.White);
                 Brush glass = new SolidColorBrush(Color.FromArgb(
-                    (byte)Math.Max(36, (int)(cardAlpha * 232)), 0xF7, 0xF5, 0xF1));
+                    (byte)Math.Min(255, (int)(cardAlpha * 232)), 0xF7, 0xF5, 0xF1));
                 glass.Freeze();
                 Titlebar.Background = glass;
                 Sidebar.Background = glass;
@@ -1109,7 +1218,8 @@ namespace WinUpd
             {
                 SetBrush("BgBrush", Color.FromRgb(0x16, 0x16, 0x15));
                 SetBrush("SurfaceBrush", Color.FromArgb(a, 20, 20, 18));
-                SetBrush("Surface2Brush", Color.FromArgb((byte)Math.Min(255, a + 14), 30, 30, 27));
+                SetBrush("Surface2Brush", Color.FromArgb(
+                    (byte)(a == 0 ? 0 : Math.Min(255, a + 14)), 30, 30, 27));
                 SetBrush("LineBrush", Color.FromArgb(56, 255, 255, 255));
                 SetBrush("LineStrongBrush", Color.FromArgb(88, 255, 255, 255));
                 SetBrush("InkBrush", Color.FromRgb(0xF2, 0xEF, 0xE9));
@@ -1129,7 +1239,7 @@ namespace WinUpd
                 SetBrush("PrimaryHoverBrush", Colors.White);
                 SetBrush("NavActiveBrush", Color.FromArgb(52, 255, 255, 255));
                 Brush glass = new SolidColorBrush(Color.FromArgb(
-                    (byte)Math.Max(170, (int)(cardAlpha * 238)), 20, 20, 18));
+                    (byte)Math.Min(255, (int)(cardAlpha * 238)), 20, 20, 18));
                 glass.Freeze();
                 Titlebar.Background = glass;
                 Sidebar.Background = glass;
@@ -1540,6 +1650,44 @@ namespace WinUpd
 
         protected override void OnClosing(CancelEventArgs e)
         {
+            // 截图调试：不拖泥带水，直接关
+            if (!string.IsNullOrEmpty(AppEnv.ShotPath))
+            {
+                _forceClose = true;
+                base.OnClosing(e);
+                return;
+            }
+            // 先让整个窗口淡出到完全透明，再真正关闭。系统注销/关机时不拖延。
+            if (!_forceClose && !Environment.HasShutdownStarted)
+            {
+                e.Cancel = true;
+                if (_closingFadeStarted) return;
+                _closingFadeStarted = true;
+                _pollTimer.Stop();
+                _saveTimer.Stop();
+                _refreshTimer.Stop();
+                if (_pageOutTimer != null)
+                {
+                    _pageOutTimer.Stop();
+                    _pageOutTimer = null;
+                }
+                if (Opacity <= 0.02)
+                {
+                    _forceClose = true;
+                    Close();
+                    return;
+                }
+                Anim.Animate(this, UIElement.OpacityProperty, Opacity, 0, 240, Anim.Soft);
+                var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(255) };
+                timer.Tick += (s, ev) =>
+                {
+                    timer.Stop();
+                    _forceClose = true;
+                    Close();
+                };
+                timer.Start();
+                return;
+            }
             _pollTimer.Stop();
             _saveTimer.Stop();
             _refreshTimer.Stop();

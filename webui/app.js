@@ -3103,7 +3103,7 @@
     /* ---------- 效果参数 ---------- */
     const effectsCard = el('div', { class: 'card' },
       personalRangeRow('模糊强度', '卡片背后的模糊程度，越大越像毛玻璃', 'blur', 0, 60, 1, ' px'),
-      personalRangeRow('卡片白纱', '卡片白色的浓度，太低文字会看不清', 'card_alpha', 40, 98, 1, ' %'),
+      personalRangeRow('卡片白纱', '卡片白色的浓度；0% 时完全透明，只剩描边和文字', 'card_alpha', 0, 98, 1, ' %'),
       personalRangeRow('图片蒙层', '整张图上的白色蒙层；图片偏深、偏花时调高更好读', 'scrim_alpha', 0, 70, 1, ' %')
     );
     host.append(sectionEl('效果',

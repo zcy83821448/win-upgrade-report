@@ -6,8 +6,9 @@
         Title="win升级报告" Width="1200" Height="800"
         MinWidth="980" MinHeight="660"
         WindowStartupLocation="CenterScreen"
-        WindowStyle="None" ResizeMode="CanResize"
-        Background="{DynamicResource BgBrush}"
+        WindowStyle="None" ResizeMode="CanResize" AllowsTransparency="True"
+        Opacity="0"
+        Background="Transparent"
         Foreground="{DynamicResource InkBrush}"
         FontFamily="{StaticResource UiFont}" FontSize="13.5"
         TextOptions.TextFormattingMode="Ideal"
@@ -15,11 +16,11 @@
 
   <shell:WindowChrome.WindowChrome>
     <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="6"
-                        GlassFrameThickness="0" CornerRadius="0"
+                        GlassFrameThickness="0" CornerRadius="14"
                         UseAeroCaptionButtons="False"/>
   </shell:WindowChrome.WindowChrome>
 
-  <Grid x:Name="Root" Background="Transparent">
+<Grid x:Name="Root" Background="Transparent">
 
     <!-- 不透明底色：没有壁纸时就是这层纸；有壁纸时被壁纸盖住 -->
     <Rectangle x:Name="BaseBg" Fill="{DynamicResource BgBrush}" IsHitTestVisible="False"/>
@@ -226,3 +227,5 @@
     </Grid>
   </Grid>
 </Window>
+
+
